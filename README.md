@@ -10,6 +10,8 @@ Core Components
 6. Walk-Forward Backtesting & Holdout ValidationThe model includes a rigorous evaluation suite:Out-of-Sample (OOS): The final 30% of historical data.Holdout Validation (2024–Present): A "blind" test on recent data that was never seen during the model's logic-tuning phase.Instrument Sleeves: Integration of leveraged/inverse instruments (SDS, SH) with an "inception guard" that falls back to non-leveraged instruments for dates preceding ETF launches (e.g., pre-2006).
 7. Performance Metrics & VisualizationThe framework generates a four-pane diagnostic dashboard:Equity Curve: Compares the blended portfolio against a "Buy & Hold" SPY benchmark.Regime Map: A scatter plot of SPY price points colored by the classified market phase.Monte Carlo Simulation: A 500-path Bates projection showing the mean expected path and variance.Scree Plot: Visualizes the variance explained by each PCA factor, confirming the efficiency of the dimensionality reduction.
 
+April 11, 2026
+
 Refactoring Changes: 
 N_FACTORS: 15 → 20
 The previous 15 factors only captured 54.79% of cross-sectional variance. Adding 5 more factors will capture roughly 60%+ — the optimizer now has more signal to work with when distinguishing growth vs. defensive vs. momentum stocks, particularly in Phase 1 where the factor portfolio does most of its heavy lifting.
