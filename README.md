@@ -32,3 +32,5 @@ Sortino ratio added to scorecard
 Given the model's deliberate asymmetric structure (lose less in Phase 3, gain more in Phase 2), Sortino is actually a more honest measure of risk-adjusted performance than Sharpe. Both are now displayed.
 
 Added Apache 2.0 Copyright License (April 11, 2026 @ 5:47PM CST)
+
+Added comments to each section that describe the code in detail.
