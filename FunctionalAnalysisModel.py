@@ -1,16 +1,17 @@
-""" Copyright [2026] [Lacy, Thomas Joseph]
+""" 
+Copyright [2026] [Lacy, Thomas Joseph]
 
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
 
-       http://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
 """
 
 import numpy as np
@@ -26,6 +27,25 @@ import warnings
 from io import StringIO
 sys.stdout.reconfigure(encoding='utf-8')
 warnings.filterwarnings("ignore")
+
+# ============================================================
+# OVERVIEW
+# ============================================================
+# This script builds a regime-aware spatial-temporal portfolio model.
+# Key building blocks in the architecture:
+#   - Regime detection: a Markov-switching-style state classifier based
+#     on VIX, SPY momentum, and market breadth.
+#   - PCA factor construction: structural decompositions of returns
+#     (X_scaled = (X - mu) / sigma; eigenvectors of covariance matrix).
+#   - Bates jump-diffusion: stochastic volatility + lognormal jumps
+#     (Heston + state-dependent jumps) for scenario generation.
+#   - Phase-specific blend definitions: tactical exposures to factor,
+#     equity, momentum, and hedges.
+#   - Out-of-sample validation and holdout testing for robustness.
+#
+# This is not a direct implementation of Hawkes or SABR, but the regime
+# classification and phase allocations serve analogous roles in the
+# broader architecture by encoding regime transitions and convexity.
 
 # ============================================================
 # CONFIG
@@ -46,6 +66,11 @@ SDS_INCEPTION       = pd.Timestamp("2006-07-11")  # SDS launch date
 # ============================================================
 # SECTION 1 — CONSTITUENT DOWNLOAD
 # ============================================================
+# Download live index constituents for SP500, DJIA, and Nasdaq-100.
+# The resulting ticker universe is used to construct the investable
+# basket and later feed the PCA factor model.
+# No modeling equations are applied here beyond set union and ticker
+# normalization.
 
 def get_html(url):
     req = urllib.request.Request(
@@ -122,6 +147,10 @@ print("Constituent fetch complete — starting download...")
 # ============================================================
 # SECTION 2 — PRICE DOWNLOAD
 # ============================================================
+# Download adjusted close price history and remove tickers with too much
+# missing data. Later returns are computed as:
+#   r_t = P_t / P_{t-1} - 1
+# which is the discrete daily return used throughout the model.
 print("Downloading price data (this will take 2-3 minutes)...")
 
 raw = yf.download(
@@ -142,6 +171,12 @@ print(f"Trading days: {raw.shape[0]}")
 # ============================================================
 # SECTION 3 — RETURNS + SLEEVE INSTRUMENTS
 # ============================================================
+# Convert adjusted close prices into daily returns using percent change.
+# Sleeve instruments provide a convexity and defensive overlay for later
+# phase blends.
+#   returns_t = (P_t / P_{t-1}) - 1
+# VIX is used as a volatility regime signal and HYG as a credit/de-risking
+# impulse indicator.
 returns = raw.pct_change().dropna()
 
 print("Downloading instrument sleeves (SDS + TLT for Phase 3/4 convexity)...")
@@ -185,6 +220,19 @@ hyg = hyg_raw.pct_change().reindex(returns.index, method="ffill").squeeze()
 # REGIME SMOOTHING: require REGIME_CONFIRM_DAYS consecutive
 # days in a new phase before recording the switch.  Eliminates
 # whipsaw from single-day VIX spikes — no lookahead involved.
+#
+# The classifier is a simple, heuristic analog to Markov-switching.
+# It derives discrete states from volatility and momentum metrics.
+# Formulas used:
+#   spy_mom_fast(t) = SPY_t / SPY_{t-21} - 1
+#   vix_zscore(t) = 0.5 * ((VIX_t - μ_{60}) / σ_{60})
+#                 + 0.5 * ((VIX_t - μ_{20}) / σ_{20})
+#   regime_t = f(vix_zscore, VIX, spy_mom_fast)
+# where μ_k and σ_k are rolling mean and standard deviation.
+#
+# Smoothing uses the rule:
+#   regime_smoothed_t = regime_smoothed_{t-1} unless
+#     candidate regime persists for REGIME_CONFIRM_DAYS.
 # ============================================================
 
 def classify_regime(vix_series, hyg_series, spy_series):
@@ -192,17 +240,17 @@ def classify_regime(vix_series, hyg_series, spy_series):
     Returns raw (unsmoothed) regime labels and the 21-day
     SPY momentum series (used for Phase 1b detection).
     """
-    spy_mom      = spy_series.pct_change(63)    # 3-month momentum
-    spy_mom_fast = spy_series.pct_change(21)    # 1-month momentum
-    vix_sma60    = vix_series.rolling(60).mean()
-    vix_sma20    = vix_series.rolling(20).mean()
-    vix_std60    = vix_series.rolling(60).std()
-    vix_std20    = vix_series.rolling(20).std()
+    spy_mom      = spy_series.pct_change(63)    # 3-month momentum: SPY_t / SPY_{t-63} - 1
+    spy_mom_fast = spy_series.pct_change(21)    # 1-month momentum: SPY_t / SPY_{t-21} - 1
+    vix_sma60    = vix_series.rolling(60).mean()  # μ_{60}
+    vix_sma20    = vix_series.rolling(20).mean()  # μ_{20}
+    vix_std60    = vix_series.rolling(60).std()   # σ_{60}
+    vix_std20    = vix_series.rolling(20).std()   # σ_{20}
 
     vix_zscore = (
         (vix_series - vix_sma60) / (vix_std60 + 1e-10) * 0.5 +
         (vix_series - vix_sma20) / (vix_std20 + 1e-10) * 0.5
-    )
+    )  # blended z-score: 0.5 z_{60} + 0.5 z_{20}
 
     regime = pd.Series(index=vix_series.index, dtype=float)
 
@@ -233,6 +281,11 @@ def smooth_regime(regime_series, window=REGIME_CONFIRM_DAYS):
     Hold the previous regime until the incoming regime has
     persisted for `window` consecutive trading days.
     Entirely backward-looking — zero lookahead.
+
+    This implements the persistence rule:
+      if regime_{t-window+1:t} are all equal to candidate,
+      then regime_smoothed_t = candidate,
+      else regime_smoothed_t = regime_smoothed_{t-1}.
     """
     smoothed = regime_series.copy()
     values   = regime_series.values.copy()
@@ -289,6 +342,13 @@ print(f"  Test:  {split_date.date()} → {returns.index[-1].date()}")
 # ============================================================
 # SECTION 5 — PCA (fit on training data ONLY)
 # ============================================================
+# Principal Component Analysis reduces the high-dimensional return
+# universe into a smaller set of orthogonal latent factors.
+# Standard scaling ensures each ticker has zero mean and unit variance:
+#   X_scaled = (X - μ) / σ
+# PCA then finds eigenvectors of the covariance matrix Σ:
+#   Σ = 1/(n-1) X_scaled^T X_scaled
+# Factor returns are the projection onto those eigenvectors.
 print(f"\nRunning PCA — extracting {N_FACTORS} factors (training data only)...")
 
 scaler               = StandardScaler()
@@ -327,8 +387,12 @@ loadings = pd.DataFrame(
 
 def factor_weights_to_stock_weights(factor_weights, loadings):
     """
-    Project factor weights → stock weights.
-    Clip negatives to zero (long-only), then normalise.
+    Project factor-level exposures into security-level weights.
+    The projection formula is:
+      w_stock = max(0, w_factors · loadings)
+    followed by normalization so that the weights sum to 1.
+    This preserves the directional signal from each factor while
+    enforcing a long-only stock portfolio.
     """
     stock_weights = np.dot(factor_weights, loadings.values)
     stock_weights = np.clip(stock_weights, 0.0, None)
@@ -342,6 +406,16 @@ def factor_weights_to_stock_weights(factor_weights, loadings):
 # ============================================================
 # SECTION 7 — BATES MODEL (jump-diffusion, regime-aware)
 # ============================================================
+# This section simulates a Bates model, which is a Heston-style
+# stochastic volatility model with additional lognormal jumps.
+# Key dynamics:
+#   dv_t = κ(θ - v_t) dt + σ √v_t dW^v_t
+#   dS_t / S_t = -½ v_t dt + √v_t dW^s_t + (J - 1) dN_t
+#   N_t ~ Poisson(λ dt)
+#   log J ~ N(μ_j, σ_j^2)
+#
+# This captures state-dependent volatility behavior and jump risk
+# in a regime-aware manner.
 
 def bates_simulate(S0, v0, kappa, theta, sigma, rho,
                    lam, mu_j, sig_j, T=1.0, steps=252, paths=1000):
@@ -359,18 +433,18 @@ def bates_simulate(S0, v0, kappa, theta, sigma, rho,
             vols[t-1]
             + kappa * (theta - vols[t-1]) * dt
             + sigma * np.sqrt(vols[t-1] * dt) * z2
-        )
+        )  # Heston variance update
         n_jumps   = np.random.poisson(lam * dt, paths)
         jump_size = (
             np.exp(mu_j * n_jumps
                    + sig_j * np.sqrt(n_jumps) * np.random.normal(0, 1, paths))
             - 1
-        )
+        )  # lognormal jump component
         prices[t] = prices[t-1] * np.exp(
             -0.5 * vols[t-1] * dt
             + np.sqrt(vols[t-1] * dt) * z1
             + np.log(1 + jump_size + 1e-10)
-        )
+        )  # price update with diffusion + jumps
     return prices, vols
 
 bates_params = {
@@ -397,6 +471,12 @@ sim_prices, sim_vols = bates_simulate(S0=spy_price, **params, paths=500)
 # ============================================================
 # SECTION 8 — METRICS
 # ============================================================
+# Performance metrics used for optimization and reporting.
+#   portfolio return = w^T μ * 252
+#   portfolio volatility = √(w^T Σ w)
+#   Sharpe = (E[r_p] - r_f) / σ_p
+#   Sortino = (E[r_p] - r_f) / σ_{down}
+#   CVaR_α = average loss among worst α% outcomes
 
 def portfolio_performance(weights, ret_matrix):
     weights     = np.array(weights)
@@ -426,7 +506,9 @@ def sortino(ret_series):
 def compute_cvar(port_rets, alpha=CVAR_ALPHA):
     """
     CVaR: average loss in the worst alpha% of outcomes.
-    [-n_tail:] selects largest losses (corrected from original).
+    Formula:
+      CVaR_α = mean( sorted(-r)[-n_tail:] )
+    where n_tail = ceil(α * N)
     """
     if len(port_rets) == 0:
         return 0.0
@@ -439,6 +521,12 @@ def compute_cvar(port_rets, alpha=CVAR_ALPHA):
 # ============================================================
 # SECTION 8b — OPTIMIZER
 # ============================================================
+# Constrained portfolio optimization over factor returns.
+# The objective functions are:
+#   - Sharpe maximisation: maximize (μ_p - rf) / σ_p
+#   - Sortino maximisation: maximize (μ_p - rf) / σ_{down}
+#   - CVaR minimisation: minimize average tail loss
+# This is solved with SLSQP under weight bounds and sum-to-one.
 
 def optimize_portfolio(ret_matrix, objective="sharpe", cvar_alpha=CVAR_ALPHA):
     n           = ret_matrix.shape[1]
@@ -491,6 +579,11 @@ def optimize_portfolio(ret_matrix, objective="sharpe", cvar_alpha=CVAR_ALPHA):
 # Phase 3   — min CVaR      (tail-risk defensive)
 # Phase 4   — Sharpe−2×CVaR (cautious re-entry, penalise tail)
 # Phase 1b  — shares Phase 2 momentum weights
+#
+# This section maps regime labels to different factor objectives,
+# generating factor weight vectors for each macro phase.
+# These weights are later projected to stock weights and blended
+# with tactical sleeves.
 # ============================================================
 print("\nOptimizing portfolio on PCA factors (training data only)...")
 
@@ -563,6 +656,11 @@ phase_factor_weights = {
 # Phase 4   — Reset: cautious re-entry with bond convexity
 #
 # All rows sum to exactly 1.0.
+#
+# The total portfolio return is computed as:
+#   R_portfolio = w_factor * R_factor + ∑ w_sleeve * R_sleeve
+# where R_factor is the projected factor return and R_sleeve is the
+# weighted return of the sleeve instruments.
 # ============================================================
 
 phase_blend = {
@@ -591,6 +689,9 @@ def compute_sleeve_return(date, blend, sleeve_df):
     Compute weighted sleeve return for a single day.
     Single source of truth — no double-counting.
     SDS redirected to SH before its 2006 inception date.
+
+    Sleeve return formula:
+      R_sleeve = ∑_{i ∈ sleeves} w_i * r_i
     """
     sleeve_ret = 0.0
     for instrument in SLEEVE_INSTRUMENTS:
@@ -620,6 +721,14 @@ def resolve_phase(date, base_phase):
 # ============================================================
 # BACKTEST LOOP — out-of-sample test period
 # ============================================================
+# The out-of-sample test blends factor-driven and sleeve returns using
+# the current effective phase. This is the model's live-style return
+# path. It uses no lookahead beyond the smoothed regime label.
+#
+# For each date:
+#   eff_phase = resolve_phase(date, base_phase)
+#   R_factor = w_factor^T * r_stocks
+#   R_portf  = blend[FACTOR] * R_factor + R_sleeve
 test_returns_raw  = returns[returns.index > split_date]
 test_regime_slice = regime[regime.index > split_date]
 test_sleeve       = sleeve_returns[sleeve_returns.index > split_date]
@@ -674,6 +783,9 @@ print("=" * 80)
 # ============================================================
 # SECTION 10 — SCORECARD (out-of-sample)
 # ============================================================
+# Compute standard out-of-sample performance metrics for the test period.
+# The benchmark is SPY buy-and-hold. Cumulative return is:
+#   (1 + r_1)(1 + r_2)...(1 + r_T) - 1
 print("\n" + "=" * 60)
 print("OUT-OF-SAMPLE PERFORMANCE (last 30% of data)")
 print("=" * 60)
@@ -807,6 +919,8 @@ print(f"\n>>> CURRENTLY ACTIVE: Phase {eff_now} ({eff_label}) <<<")
 # ============================================================
 # SECTION 12 — CHARTS
 # ============================================================
+# Visualize the model outputs: cumulative returns, regime state map,
+# Bates scenario simulation, and PCA variance explained.
 fig, axes = plt.subplots(2, 2, figsize=(16, 10))
 fig.suptitle("Spatial-Temporal Portfolio Model — v3", fontsize=14)
 
@@ -849,6 +963,9 @@ axes[1, 1].set_title("PCA Variance Explained")
 axes[1, 1].set_xlabel("Factor")
 axes[1, 1].set_ylabel("Variance Explained (%)")
 axes[1, 1].legend()
+
+plt.tight_layout()
+plt.show()
 
 plt.tight_layout()
 plt.show()
