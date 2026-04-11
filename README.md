@@ -34,3 +34,15 @@ Given the model's deliberate asymmetric structure (lose less in Phase 3, gain mo
 Added Apache 2.0 Copyright License (April 11, 2026 @ 5:47PM CST)
 
 Added comments to each section that describe the code in detail.
+
+_________________________________________________________________
+How to Use:
+
+# Clone the repository
+git clone https://github.com/YourUsername/RepositoryName.git
+
+# Install dependencies
+pip install numpy pandas yfinance matplotlib scipy scikit-learn
+
+# Run the model
+python FunctionalAnalysisModel.py
