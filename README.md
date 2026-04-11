@@ -9,3 +9,22 @@ Core Components
 5. Stochastic Volatility: The Bates ModelFor forward-looking projections, the script implements the Bates Model—an extension of the Heston model that incorporates Poisson Jump-Diffusion.Jump Dynamics: Unlike standard Monte Carlo, this accounts for "black swan" jumps in price, calibrated to the current market regime’s jump intensity ($\lambda$) and mean jump size ($\mu_j$).Regime Calibration: Parameters like $\kappa$ (mean reversion speed) and $\rho$ (volatility/price correlation) are updated in real-time based on the active market phase.
 6. Walk-Forward Backtesting & Holdout ValidationThe model includes a rigorous evaluation suite:Out-of-Sample (OOS): The final 30% of historical data.Holdout Validation (2024–Present): A "blind" test on recent data that was never seen during the model's logic-tuning phase.Instrument Sleeves: Integration of leveraged/inverse instruments (SDS, SH) with an "inception guard" that falls back to non-leveraged instruments for dates preceding ETF launches (e.g., pre-2006).
 7. Performance Metrics & VisualizationThe framework generates a four-pane diagnostic dashboard:Equity Curve: Compares the blended portfolio against a "Buy & Hold" SPY benchmark.Regime Map: A scatter plot of SPY price points colored by the classified market phase.Monte Carlo Simulation: A 500-path Bates projection showing the mean expected path and variance.Scree Plot: Visualizes the variance explained by each PCA factor, confirming the efficiency of the dimensionality reduction.
+
+Refactoring Changes: 
+N_FACTORS: 15 → 20
+The previous 15 factors only captured 54.79% of cross-sectional variance. Adding 5 more factors will capture roughly 60%+ — the optimizer now has more signal to work with when distinguishing growth vs. defensive vs. momentum stocks, particularly in Phase 1 where the factor portfolio does most of its heavy lifting.
+
+MAX_WEIGHT: 0.15 → 0.10
+Single-stock concentration is one of the cleanest levers for Sharpe improvement. Tighter caps force wider diversification, which reduces idiosyncratic variance without reducing expected return — the numerator stays the same, denominator shrinks.
+
+Regime transition smoothing (REGIME_CONFIRM_DAYS = 5)
+The original regime switched on a single day's signal. A one-day VIX spike could flip the model into Phase 3 (30% SDS exposure) and then back out the next day, generating large one-day returns that spike the variance calculation. Requiring 5 consecutive days of agreement before recording a phase change eliminates this noise. Completely backward-looking — zero lookahead.
+
+Phase 1b — Momentum Acceleration sub-phase
+This is the primary Sharpe driver. Phase 1 is 80% of all trading days, and it's where the model was leaving returns on the table in 2013, 2017, and 2024. When the base regime is Phase 1 AND 21-day SPY return exceeds 3%, resolve_phase() upgrades to Phase 1b: the blend shifts to 40% factor / 20% SPY / 40% QQQ using the momentum-optimized stock weights. The 3% threshold is grounded in momentum factor literature — it's roughly equivalent to 18% annualized — not fitted to specific years.
+
+Phase 2 optimizer: Sharpe → Sortino
+Phase 2 days have positively skewed returns — that's the whole point of riding a momentum bull. Sharpe penalizes upside variance the same as downside, which actively discourages selecting the stocks that occasionally spike hard upward. Sortino only penalizes downside deviation, so the Phase 2 (and Phase 1b) factor portfolio now explicitly seeks asymmetric upside.
+
+Sortino ratio added to scorecard
+Given the model's deliberate asymmetric structure (lose less in Phase 3, gain more in Phase 2), Sortino is actually a more honest measure of risk-adjusted performance than Sharpe. Both are now displayed.
