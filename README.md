@@ -39,7 +39,7 @@ _________________________________________________________________
 How to Use:
 
 # Clone the repository
-git clone https://github.com/YourUsername/RepositoryName.git
+git clone https://github.com/TLace03/FunctionalAnalysisModel.py.git
 
 # Install dependencies
 pip install numpy pandas yfinance matplotlib scipy scikit-learn
