@@ -98,7 +98,7 @@ pip install numpy pandas yfinance matplotlib scipy scikit-learn anthropic
 
 # Run the model
 python FunctionalAnalysisModel.py
-
+__________________________________________________________________
 For NewsAgent.py
 ***Install the optional LLM tier:***
 
