@@ -26,10 +26,10 @@ from datetime import datetime, timedelta
 
 class DerivativesHedger:
     def __init__(self,
-                 hedge_ratio: float = 0.50,           # % of equity exposure to hedge with puts
-                 put_otm_strike: float = 0.95,       # 5% OTM put
-                 put_tenor_days: int = 30,           # ~1 month
-                 max_daily_hedge_cost_bp: float = 8): # cap premium drag
+                 hedge_ratio: float = 0.50,
+                 put_otm_strike: float = 0.95,
+                 put_tenor_days: int = 30,
+                 max_daily_hedge_cost_bp: float = 8):
         self.hedge_ratio = hedge_ratio
         self.put_otm_strike = put_otm_strike
         self.put_tenor_days = put_tenor_days
@@ -37,35 +37,30 @@ class DerivativesHedger:
 
     def _get_vix(self, date: pd.Timestamp = None) -> float:
         """Live or historical VIX level (used as implied-vol proxy)."""
-        vix = yf.download("^VIX", period="5d", interval="1d", progress=False)["Close"]
-        if date is None or date >= vix.index[-1]:
-            return float(vix.iloc[-1])
-        # historical lookup (nearest prior trading day)
+        vix_data = yf.download("^VIX", period="5d", interval="1d", progress=False)["Close"]
+        if date is None or date >= vix_data.index[-1]:
+            return float(vix_data.iloc[-1])          # ← now guaranteed scalar
         try:
-            return float(vix.asof(date))
+            return float(vix_data.asof(date))
         except:
-            return 19.2  # fallback to current regime value
+            return 19.2  # fallback
 
     def is_drawdown(self, spy_returns: pd.Series, current_regime: int, window: int = 21,
                     return_threshold: float = -0.05) -> bool:
-        """True if rolling SPY return is bad OR we are already in Phase 3."""
         if current_regime == 3:
             return True
         roll = spy_returns.rolling(window).sum().iloc[-1]
         return roll < return_threshold
 
     def _approximate_put_pnl(self, spy_daily_return: float, vix: float) -> float:
-        """Simple but realistic daily P/L for a 1-month 5% OTM put (backtest only)."""
-        # Premium ≈ (VIX / 100) * sqrt(tenor/365) * notional (Black-Scholes rule-of-thumb)
         annual_vol = vix / 100
         tenor_yr = self.put_tenor_days / 365.0
-        premium = annual_vol * np.sqrt(tenor_yr) * 0.4  # 40% of vol for OTM put
-        premium = min(premium, self.max_daily_hedge_cost_bp)  # daily decay cap
+        premium = annual_vol * np.sqrt(tenor_yr) * 0.4
+        premium = min(premium, self.max_daily_hedge_cost_bp)
 
-        # Payoff: max(0, strike - spot) approximated on daily move
         strike_level = self.put_otm_strike
         if spy_daily_return < (strike_level - 1.0):
-            payoff = -(spy_daily_return - (strike_level - 1.0))  # intrinsic gain
+            payoff = -(spy_daily_return - (strike_level - 1.0))
         else:
             payoff = 0.0
 
@@ -78,15 +73,11 @@ class DerivativesHedger:
                     current_regime: int,
                     date: pd.Timestamp = None,
                     live_mode: bool = False) -> float:
-        """
-        Returns adjusted daily portfolio return with hedge P/L.
-        In live_mode also prints actionable trade suggestions.
-        """
         vix = self._get_vix(date)
         drawdown = self.is_drawdown(pd.Series([spy_daily_return]), current_regime)
 
         if not drawdown:
-            return portfolio_daily_return  # no hedge needed
+            return portfolio_daily_return
 
         hedge_pnl = self._approximate_put_pnl(spy_daily_return, vix)
 
@@ -94,10 +85,9 @@ class DerivativesHedger:
             print(f"\n[DerivativesHedger] DRAW DOWN DETECTED — Regime {current_regime} | VIX {vix:.1f}")
             print(f"   → Hedge {self.hedge_ratio*100:.0f}% of equity exposure with 1-month SPY puts")
             print(f"   → Suggested notional: ~${int(100_000 * self.hedge_ratio):,} per $100k portfolio")
-            # Live option chain (for actual trading)
             try:
                 spy = yf.Ticker("SPY")
-                opts = spy.option_chain(spy.options[0])  # nearest expiry
+                opts = spy.option_chain(spy.options[0])
                 puts = opts.puts
                 target_strike = round(spy.history(period="1d")["Close"].iloc[-1] * self.put_otm_strike, 0)
                 candidate = puts[puts["strike"] == target_strike].iloc[0] if not puts.empty else None
@@ -108,9 +98,6 @@ class DerivativesHedger:
 
         return portfolio_daily_return + hedge_pnl
 
-# ============================================================
-# Simple test when run directly
-# ============================================================
 if __name__ == "__main__":
     hedger = DerivativesHedger()
     print("DerivativesTrading.py loaded — ready for integration into FAMWithAIA.py")
