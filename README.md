@@ -1,4 +1,4 @@
-# Functional-Analysis-Model
+# Functional-Analysis-Model Changes
 A proprietary quantitative analysis model that utilizes my proprietary framework I call "Spatial-Temporal map of Market Volatility"
 Technical Overview: Spatial-Temporal Quantitative FrameworkFunctionalAnalysisModel.py is a high-performance quantitative trading and portfolio management framework. It utilizes a regime-switching architecture to dynamically rotate between factor-driven stock portfolios and defensive ETF "sleeves." The model integrates Principal Component Analysis (PCA) for dimensionality reduction and the Bates Jump-Diffusion Model for forward-looking risk assessment.
 Core Components
@@ -87,6 +87,67 @@ Block 1 (after warnings.filterwarnings): The import + initialisation block. Wrap
 Block 2 (resolve_phase): After the existing Phase 1→1b momentum check, _news_signal.adjust_phase(base_phase, date) is called. The adjust_phase method has three rules: force Phase 3 if Polymarket recession >75%, demote Phase 1b to Phase 1 if recession >60%, and demote Phase 1b if news sentiment is strongly bearish. All three are no-ops for historical dates.
 
 Block 3 & 4 (backtest loop + holdout loop): After blend = phase_blend[eff_phase], _news_signal.adjust_blend(blend, date) is called. This applies marginal nudges — up to +6pp GLD for elevated geopolitical risk, +5pp TLT when Fed-cut probability is high, +5pp TQQQ when risk-on score is very strong in Phase 1 — each proportional to signal strength with no cliff edges. Again, no-op for historical dates.
+
+# Functional Analysis Model (FAM) with AI Augmentation + Derivatives Hedging
+
+A regime-aware, spatial-temporal quantitative portfolio framework** that dynamically rotates between PCA-factor stock sleeves and defensive ETF overlays based on real-time market volatility regimes. Now includes live macro news intelligence (**NewsAgent**) and protective put derivatives hedging during drawdowns and Phase 3 (Unwind).
+
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
+![Last Update](https://img.shields.io/badge/last%20updated-April%202026-green)
+
+____________________________________________________________________________________________________________________________________________________________________________________________________________________________
+Model Description
+The **Functional Analysis Model** treats the equity market as a high-dimensional dynamical system and extracts orthogonal risk factors via PCA (eigen-decomposition of the covariance matrix). 
+It then classifies the market into four primary regimes (plus a momentum-acceleration sub-phase) using VIX z-scores, SPY momentum, and credit-spread signals. 
+
+Portfolio construction is **phase-specific**:
+
+- **Phase 1 (Buildout)**: Quality/value factor tilt + core SPY
+- **Phase 1b (Momentum Acceleration)**: Rotates into TQQQ when short-term momentum surges
+- **Phase 2 (Narrative)**: Full TQQQ momentum blow-off
+- **Phase 3 (Unwind)**: Aggressive short equity + safe-haven convexity (GLD, SH, SDS, TLT)
+- **Phase 4 (Reset)**: Cautious re-entry with bond and gold exposure
+
+**New in v3 (April 2026)**:
+- Full **DerivativesTrading.py** module with automatic protective-put overlay (≈5% OTM, 1-month SPY puts) during Phase 3 or detected drawdowns
+- Asymmetric regime smoothing (fast entry into Unwind, slow exit)
+- Live **NewsAgent** integration (Polymarket, RSS, FOREX, optional Claude LLM scoring)
+- Bates Jump-Diffusion Monte-Carlo calibrated to current regime
+- Walk-forward OOS + true blind 2024–present holdout validation
+
+The model is **production-oriented**, zero-lookahead, and prints a clean four-pane diagnostic dashboard on every run.
+
+Key Features
+
+- **Regime Classifier** — Markov-style heuristic using blended VIX z-scores and 21/63-day SPY momentum. 5-day persistence filter prevents whipsaw.
+- **PCA Factor Model** — 20 orthogonal factors extracted on training data only (explains ~56–60% cross-sectional variance). Long-only clipped loadings projected to stock weights.
+- **Phase-Specific Optimizers** — Sharpe (Phase 1/4), Sortino (Phase 1b/2), CVaR 5% (Phase 3).
+- **Derivatives Hedging** — Automatic protective-put overlay via `DerivativesHedger`. In backtests uses VIX as implied-vol proxy; in live mode fetches real option chains and prints exact contracts.
+- **NewsAgent Layer** — Live macro sentiment, risk-on score, recession probability (Polymarket), and blend nudges. Strictly additive for live dates only — historical backtests remain unchanged.
+- **Bates Jump-Diffusion** — Stochastic volatility + Poisson jumps, regime-calibrated parameters for forward scenario generation.
+- **Robust Backtesting** — 70/30 walk-forward split + independent 2024–present holdout. All metrics (Sharpe, Sortino, Calmar, Max DD) computed post-hedge.
+- **Sleeve Instruments** — SPY, TQQQ, GLD, SH, SDS, TLT (SDS auto-rerouted to SH pre-2006).
+- **Universe** — Live Wikipedia scrape of S&P 500 + DJIA + Nasdaq-100, filtered for 50-year data quality.
+
+Performance (as of latest run — April 13 2026)
+
+**Out-of-Sample (last 30% of data)**
+- Portfolio Total Return: **5,676%**
+- SPY B&H: 608%
+- Sharpe: **1.366** vs 0.717
+- Sortino: **1.746** vs 0.888
+- Max Drawdown: **-30.15%** vs -33.72%
+
+**2024–Present Blind Holdout (never tuned on)**
+- Portfolio: **+124.84%**
+- SPY: +47.71%
+- Sharpe: **1.596** vs 0.964
+- Sortino: **2.048** vs 1.254
+- Max Drawdown: **-13.71%** vs -18.76%
+
+(The derivatives hedge further reduces tail risk in live/Phase-3 periods.)
+
 _________________________________________________________________
 How to Use:
 
