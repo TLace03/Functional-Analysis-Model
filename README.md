@@ -155,7 +155,7 @@ How to Use:
 git clone https://github.com/TLace03/Functional-Analysis-Model.git
 
 # Install dependencies
-pip install numpy pandas yfinance matplotlib scipy scikit-learn anthropic
+pip install numpy pandas yfinance matplotlib scipy scikit-learn anthropic torch numba
 
 # Run the model
 python FunctionalAnalysisModel.py
