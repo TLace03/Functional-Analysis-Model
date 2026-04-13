@@ -92,6 +92,8 @@ Block 3 & 4 (backtest loop + holdout loop): After blend = phase_blend[eff_phase]
 
 A regime-aware, spatial-temporal quantitative portfolio framework** that dynamically rotates between PCA-factor stock sleeves and defensive ETF overlays based on real-time market volatility regimes. Now includes live macro news intelligence (**NewsAgent**) and protective put derivatives hedging during drawdowns and Phase 3 (Unwind).
 
+Updated each file to utilize parallelized computation
+
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 ![Last Update](https://img.shields.io/badge/last%20updated-April%202026-green)
