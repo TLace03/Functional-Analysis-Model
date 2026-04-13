@@ -81,7 +81,7 @@ Tier 3 — FOREX snapshot (yfinance, already a dependency): 5-day returns on DXY
 
 Tier 4 — Headline scoring: If ANTHROPIC_API_KEY is set, claude-haiku-4-5-20251001 scores the top 30 headlines into structured JSON (macro_sentiment, risk_on_score, geo_risk_score, top risks, top tailwinds). If the key is absent or the call fails, a deterministic weighted-keyword fallback using np.tanh normalisation runs instead. The model never blocks or fails on this tier.
 
-Changes to FunctionalAnalysisModel.py — exactly four edits:
+Changes to FunctionalAnalysisModel.py used to create FAMWithAIA.py — exactly four edits:
 Block 1 (after warnings.filterwarnings): The import + initialisation block. Wrapped in try/except — if NewsAgent.py isn't in the same directory, the model runs exactly as before. _news_signal = None is the fallback.
 
 Block 2 (resolve_phase): After the existing Phase 1→1b momentum check, _news_signal.adjust_phase(base_phase, date) is called. The adjust_phase method has three rules: force Phase 3 if Polymarket recession >75%, demote Phase 1b to Phase 1 if recession >60%, and demote Phase 1b if news sentiment is strongly bearish. All three are no-ops for historical dates.
