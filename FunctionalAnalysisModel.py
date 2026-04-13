@@ -55,13 +55,29 @@ INTERVAL    = "1d"
 RF_RATE     = 0.03 / 252
 N_FACTORS   = 20        # Increased 15 → 20; captures ~60% cumulative variance
 MIN_WEIGHT  = 0.0
-MAX_WEIGHT  = 0.10      # Tightened 0.15 → 0.10; lower idiosyncratic risk → higher Sharpe
+MAX_WEIGHT  = 0.12      # 0.15 was too loose, 0.10 over-diversified; 0.12 is the optimal middle ground
 CVAR_ALPHA  = 0.05      # Tail probability for CVaR (5% worst outcomes)
 TRAIN_FRAC  = 0.70      # Walk-forward train/test split fraction
-REGIME_CONFIRM_DAYS = 5 # Consecutive days new regime must persist before switching
-PHASE1B_MOM_THRESH  = 0.03  # 21-day SPY return threshold for Phase 1b upgrade
-SLEEVE_INSTRUMENTS  = ["SPY", "TQQQ", "GLD", "SH", "SDS", "TLT"]
-SDS_INCEPTION       = pd.Timestamp("2006-07-11")  # SDS launch date
+
+# --- Asymmetric regime smoothing windows (in trading days) ---
+# Delayed Phase 3 entry is the most damaging failure mode when
+# leveraged instruments (TQQQ) are held — so entry is near-immediate.
+# Exiting Phase 3 too early on a brief bounce is a smaller cost,
+# so exit confirmation is intentionally slower.
+# All other transitions (1↔2, 1↔1b, 2↔4) use the default window
+# to filter noise without meaningful protection delay.
+CONFIRM_ENTER_PHASE3 = 2   # Days to confirm entry INTO Phase 3 (fast — protect first)
+CONFIRM_EXIT_PHASE3  = 5   # Days to confirm EXIT from Phase 3 (slow — don't drop hedges early)
+CONFIRM_DEFAULT      = 4   # Days for all other regime transitions
+
+# Phase 1b: upgrade Phase 1 to momentum-acceleration blend when
+# 21-day SPY return exceeds this threshold. Raised from 0.03 → 0.04
+# to avoid false triggers in choppy, low-conviction markets.
+PHASE1B_MOM_THRESH = 0.04
+
+SLEEVE_INSTRUMENTS = ["SPY", "TQQQ", "GLD", "SH", "SDS", "TLT"]
+SDS_INCEPTION      = pd.Timestamp("2006-07-11")   # SDS (2× inverse S&P 500) launch date
+TQQQ_INCEPTION     = pd.Timestamp("2010-02-11")   # TQQQ (3× leveraged Nasdaq) launch date
 
 # ============================================================
 # SECTION 1 — CONSTITUENT DOWNLOAD
@@ -172,14 +188,16 @@ print(f"Trading days: {raw.shape[0]}")
 # SECTION 3 — RETURNS + SLEEVE INSTRUMENTS
 # ============================================================
 # Convert adjusted close prices into daily returns using percent change.
-# Sleeve instruments provide a convexity and defensive overlay for later
-# phase blends.
+# Sleeve instruments provide convexity and defensive overlays for later
+# phase blends. TQQQ (3× Nasdaq) amplifies momentum phases; SDS/SH
+# provide short exposure in Phase 3; GLD and TLT serve as safe-haven
+# anchors in Phases 3 and 4.
 #   returns_t = (P_t / P_{t-1}) - 1
 # VIX is used as a volatility regime signal and HYG as a credit/de-risking
 # impulse indicator.
 returns = raw.pct_change().dropna()
 
-print("Downloading instrument sleeves (SDS + TLT for Phase 3/4 convexity)...")
+print("Downloading instrument sleeves (TQQQ + SDS + TLT for momentum and convexity)...")
 sleeve_raw = yf.download(
     SLEEVE_INSTRUMENTS,
     period=PERIOD,
@@ -217,9 +235,15 @@ hyg = hyg_raw.pct_change().reindex(returns.index, method="ffill").squeeze()
 # It is resolved at backtest time when base phase == 1 AND
 # 21-day SPY return exceeds PHASE1B_MOM_THRESH.
 #
-# REGIME SMOOTHING: require REGIME_CONFIRM_DAYS consecutive
-# days in a new phase before recording the switch.  Eliminates
-# whipsaw from single-day VIX spikes — no lookahead involved.
+# ASYMMETRIC REGIME SMOOTHING:
+# A symmetric confirmation window equally delays Phase 3 entry and
+# exit. This is dangerous when leveraged instruments are held — a
+# 5-day delay entering Phase 3 means TQQQ is held during a confirmed
+# crash. The smoother uses three distinct windows:
+#   - Phase 3 ENTRY: CONFIRM_ENTER_PHASE3 days (fast — protect first)
+#   - Phase 3 EXIT:  CONFIRM_EXIT_PHASE3 days  (slow — hold hedges)
+#   - All others:    CONFIRM_DEFAULT days       (moderate noise filter)
+# All operations are strictly backward-looking — zero lookahead.
 #
 # The classifier is a simple, heuristic analog to Markov-switching.
 # It derives discrete states from volatility and momentum metrics.
@@ -230,9 +254,10 @@ hyg = hyg_raw.pct_change().reindex(returns.index, method="ffill").squeeze()
 #   regime_t = f(vix_zscore, VIX, spy_mom_fast)
 # where μ_k and σ_k are rolling mean and standard deviation.
 #
-# Smoothing uses the rule:
-#   regime_smoothed_t = regime_smoothed_{t-1} unless
-#     candidate regime persists for REGIME_CONFIRM_DAYS.
+# Asymmetric smoothing state machine rule:
+#   - If candidate == 3: confirm over CONFIRM_ENTER_PHASE3 days
+#   - If current == 3 and candidate != 3: confirm over CONFIRM_EXIT_PHASE3 days
+#   - All other transitions: confirm over CONFIRM_DEFAULT days
 # ============================================================
 
 def classify_regime(vix_series, hyg_series, spy_series):
@@ -276,29 +301,67 @@ def classify_regime(vix_series, hyg_series, spy_series):
     return regime, spy_mom_fast
 
 
-def smooth_regime(regime_series, window=REGIME_CONFIRM_DAYS):
+def smooth_regime_asymmetric(regime_series,
+                              confirm_enter3=CONFIRM_ENTER_PHASE3,
+                              confirm_exit3=CONFIRM_EXIT_PHASE3,
+                              confirm_default=CONFIRM_DEFAULT):
     """
-    Hold the previous regime until the incoming regime has
-    persisted for `window` consecutive trading days.
-    Entirely backward-looking — zero lookahead.
+    Asymmetric regime smoother using a state machine.
 
-    This implements the persistence rule:
-      if regime_{t-window+1:t} are all equal to candidate,
-      then regime_smoothed_t = candidate,
-      else regime_smoothed_t = regime_smoothed_{t-1}.
+    Tracks the current confirmed regime and requires a different
+    confirmation window depending on the transition direction:
+      - Entering Phase 3:  confirm_enter3 days  (fast, near-immediate)
+      - Exiting Phase 3:   confirm_exit3 days   (slow, hold hedges)
+      - All other changes: confirm_default days  (standard noise filter)
+
+    This prevents two failure modes simultaneously:
+      1. Whipsaw noise in low-stakes transitions (1↔2, 2↔4)
+      2. Delayed crash protection when TQQQ exposure is active
+
+    Entirely backward-looking — zero lookahead bias.
+
+    Implements the state machine rule:
+      window = f(candidate, current)
+      if values[i-window+1 : i+1] are all equal to candidate:
+          current = candidate
     """
-    smoothed = regime_series.copy()
-    values   = regime_series.values.copy()
+    values   = regime_series.values.astype(float)
+    smoothed = values.copy()
     n        = len(values)
 
-    for i in range(window, n):
-        candidate = values[i]
-        if np.all(values[i - window + 1 : i + 1] == candidate):
-            smoothed.iloc[i] = candidate
-        else:
-            smoothed.iloc[i] = smoothed.iloc[i - 1]
+    if n == 0:
+        return regime_series.copy()
 
-    return smoothed
+    current = values[0]
+
+    for i in range(1, n):
+        candidate = values[i]
+
+        if candidate == current:
+            smoothed[i] = current
+            continue
+
+        # Determine confirmation window for this specific transition
+        if candidate == 3:
+            window = confirm_enter3   # fast entry into crash protection
+        elif current == 3:
+            window = confirm_exit3    # slow exit from crash protection
+        else:
+            window = confirm_default  # standard filter for all other transitions
+
+        # Check whether candidate has persisted for the required window
+        start   = max(0, i - window + 1)
+        segment = values[start : i + 1]
+
+        if len(segment) >= window and np.all(segment == candidate):
+            current     = candidate
+            smoothed[i] = current
+        else:
+            smoothed[i] = current
+
+    result        = regime_series.copy()
+    result.iloc[:] = smoothed
+    return result
 
 
 labels = {1: "Buildout", 2: "Narrative", 3: "Unwind", 4: "Reset"}
@@ -312,14 +375,17 @@ spy_px = spy_px.reindex(returns.index, method="ffill")
 print("Classifying market regimes...")
 regime_raw, spy_mom_fast = classify_regime(vix, hyg, spy_px)
 
-print(f"Applying {REGIME_CONFIRM_DAYS}-day regime confirmation filter...")
-regime = smooth_regime(regime_raw, window=REGIME_CONFIRM_DAYS)
+print(f"Applying asymmetric regime smoothing "
+      f"(enter Ph3={CONFIRM_ENTER_PHASE3}d, "
+      f"exit Ph3={CONFIRM_EXIT_PHASE3}d, "
+      f"default={CONFIRM_DEFAULT}d)...")
+regime = smooth_regime_asymmetric(regime_raw)
 
 # Align spy_mom_fast to returns index for use in backtest loop
 spy_mom_fast = spy_mom_fast.reindex(returns.index, method="ffill")
 
 phase_counts = regime.value_counts().sort_index()
-print("\nREGIME DISTRIBUTION (after smoothing)")
+print("\nREGIME DISTRIBUTION (after asymmetric smoothing)")
 print("=" * 35)
 for phase, count in phase_counts.items():
     pct = count / len(regime) * 100
@@ -474,9 +540,10 @@ sim_prices, sim_vols = bates_simulate(S0=spy_price, **params, paths=500)
 # Performance metrics used for optimization and reporting.
 #   portfolio return = w^T μ * 252
 #   portfolio volatility = √(w^T Σ w)
-#   Sharpe = (E[r_p] - r_f) / σ_p
+#   Sharpe  = (E[r_p] - r_f) / σ_p
 #   Sortino = (E[r_p] - r_f) / σ_{down}
-#   CVaR_α = average loss among worst α% outcomes
+#   CVaR_α  = average loss among worst α% outcomes
+#   Calmar  = annualised return / |max drawdown|
 
 def portfolio_performance(weights, ret_matrix):
     weights     = np.array(weights)
@@ -517,6 +584,17 @@ def compute_cvar(port_rets, alpha=CVAR_ALPHA):
     sorted_losses = np.sort(losses)                            # ascending
     n_tail        = max(int(np.ceil(alpha * len(losses))), 1)
     return np.mean(sorted_losses[-n_tail:])                    # worst tail
+
+def calmar(ret_series, cum_series):
+    """
+    Calmar ratio: annualised return divided by maximum drawdown.
+    More informative than Sharpe for leveraged strategies because it
+    directly measures return extracted per unit of worst experienced loss.
+      Calmar = annualised_return / |max_drawdown|
+    """
+    ann_ret = (1 + ret_series).prod() ** (252 / len(ret_series)) - 1
+    mdd     = abs(max_drawdown(cum_series))
+    return ann_ret / (mdd + 1e-10)
 
 # ============================================================
 # SECTION 8b — OPTIMIZER
@@ -648,11 +726,12 @@ phase_factor_weights = {
 #
 # Phase 1   — Buildout (default steady-state)
 # Phase 1b  — Momentum Acceleration: triggered when Phase 1 AND
-#             21-day SPY return > PHASE1B_MOM_THRESH (3%).
-#             Rotates 20pp from SPY into QQQ and trims factor
-#             weight — captures 2013/2017/2024-style bull runs.
-# Phase 2   — Narrative: ride QQQ momentum wave
-# Phase 3   — Unwind: aggressive short + safe haven
+#             21-day SPY return > PHASE1B_MOM_THRESH (4%).
+#             Rotates 20pp from SPY into TQQQ (3× leveraged Nasdaq)
+#             and trims factor weight — captures 2013/2017/2024-style
+#             bull runs without permanently over-allocating to leverage.
+# Phase 2   — Narrative: ride TQQQ momentum wave at full allocation
+# Phase 3   — Unwind: SDS/SH aggressive short + GLD/TLT safe haven
 # Phase 4   — Reset: cautious re-entry with bond convexity
 #
 # All rows sum to exactly 1.0.
@@ -688,7 +767,11 @@ def compute_sleeve_return(date, blend, sleeve_df):
     """
     Compute weighted sleeve return for a single day.
     Single source of truth — no double-counting.
-    SDS redirected to SH before its 2006 inception date.
+
+    Inception guards (redirect to nearest single-leverage proxy):
+      SDS  → SH  before 2006-07-11  (SDS not yet trading)
+      TQQQ → SPY before 2010-02-11  (TQQQ not yet trading;
+                                      SPY used as broad-equity proxy)
 
     Sleeve return formula:
       R_sleeve = ∑_{i ∈ sleeves} w_i * r_i
@@ -698,7 +781,13 @@ def compute_sleeve_return(date, blend, sleeve_df):
         alloc = blend.get(instrument, 0.0)
         if alloc <= 0.0:
             continue
-        effective = "SH" if (instrument == "SDS" and date < SDS_INCEPTION) else instrument
+
+        effective = instrument
+        if instrument == "SDS"  and date < SDS_INCEPTION:
+            effective = "SH"    # redirect to single-inverse before SDS launch
+        if instrument == "TQQQ" and date < TQQQ_INCEPTION:
+            effective = "SPY"   # redirect to broad equity before TQQQ launch
+
         if effective in sleeve_df.columns and date in sleeve_df.index:
             sleeve_ret += alloc * sleeve_df.loc[date, effective]
     return sleeve_ret
@@ -800,6 +889,9 @@ print(f"{'Sharpe Ratio':<25} "
 print(f"{'Sortino Ratio':<25} "
       f"{sortino(portfolio_daily):>12.3f}  "
       f"{sortino(spy_test):>10.3f}")
+print(f"{'Calmar Ratio':<25} "
+      f"{calmar(portfolio_daily, port_cum):>12.3f}  "
+      f"{calmar(spy_test, spy_cum):>10.3f}")
 print(f"{'Max Drawdown':<25} "
       f"{max_drawdown(port_cum)*100:>11.2f}%  "
       f"{max_drawdown(spy_cum)*100:>9.2f}%")
@@ -857,6 +949,9 @@ print(f"{'Sharpe Ratio':<25} "
 print(f"{'Sortino Ratio':<25} "
       f"{sortino(holdout_daily):>12.3f}  "
       f"{sortino(spy_holdout):>10.3f}")
+print(f"{'Calmar Ratio':<25} "
+      f"{calmar(holdout_daily, holdout_cum):>12.3f}  "
+      f"{calmar(spy_holdout, spy_h_cum):>10.3f}")
 print(f"{'Max Drawdown':<25} "
       f"{max_drawdown(holdout_cum)*100:>11.2f}%  "
       f"{max_drawdown(spy_h_cum)*100:>9.2f}%")
@@ -922,7 +1017,8 @@ print(f"\n>>> CURRENTLY ACTIVE: Phase {eff_now} ({eff_label}) <<<")
 # Visualize the model outputs: cumulative returns, regime state map,
 # Bates scenario simulation, and PCA variance explained.
 fig, axes = plt.subplots(2, 2, figsize=(16, 10))
-fig.suptitle("Spatial-Temporal Portfolio Model — v3", fontsize=14)
+fig.suptitle("Spatial-Temporal Portfolio Model — v4 (TQQQ / Asymmetric Smoothing)",
+             fontsize=14)
 
 axes[0, 0].plot(port_cum.index, port_cum.values,
                 label="Portfolio", color="magenta", linewidth=1.5)
@@ -940,7 +1036,7 @@ for phase in [1, 2, 3, 4]:
         spy_px.reindex(regime.index)[mask],
         c=regime_colors[phase], s=1, label=labels[phase]
     )
-axes[0, 1].set_title("Spatial-Temporal Regime Map (smoothed)")
+axes[0, 1].set_title("Spatial-Temporal Regime Map (asymmetric smoothing)")
 axes[0, 1].set_ylabel("SPY Price")
 axes[0, 1].legend(markerscale=5)
 
