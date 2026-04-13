@@ -35,6 +35,10 @@ Added Apache 2.0 Copyright License (April 11, 2026 @ 5:47PM CST)
 
 Added comments to each section that describe the code in detail.
 
+April 13, 2026
+
+Changed QQQ to TQQQ in Sleeve_Instruments 
+
 _________________________________________________________________
 How to Use:
 
