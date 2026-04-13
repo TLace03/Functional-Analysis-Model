@@ -39,6 +39,36 @@ April 13, 2026
 
 Changed QQQ to TQQQ in Sleeve_Instruments 
 
+CONFIG block — 6 changes:
+
+MAX_WEIGHT comment: updated to explain the 0.12 middle-ground rationale
+REGIME_CONFIRM_DAYS removed — replaced by three named constants below it
+Added CONFIRM_ENTER_PHASE3 = 2, CONFIRM_EXIT_PHASE3 = 5, CONFIRM_DEFAULT = 4 with explanatory comments for each
+PHASE1B_MOM_THRESH: 0.03 → 0.04, comment updated to explain why (false triggers in choppy markets)
+Added TQQQ_INCEPTION = pd.Timestamp("2010-02-11")
+
+Section 3 comment: updated to name TQQQ and explain its role alongside SDS/GLD/TLT
+
+Section 4 comment block: rewritten to describe asymmetric smoothing, explain the three windows, and document the state machine logic — the old symmetric description was replaced entirely
+
+smooth_regime function: replaced with smooth_regime_asymmetric — the state machine implementation with the three-window logic and a full docstring explaining both failure modes it prevents
+
+Print statement: updated from "Applying N-day regime confirmation filter..." to the asymmetric window summary
+
+Regime distribution header: updated from "(after smoothing)" to "(after asymmetric smoothing)"
+
+Section 8 metrics comment: added Calmar = annualised return / |max drawdown| to the formula list
+
+calmar function: added with docstring explaining why it's more informative than Sharpe for leveraged strategies
+
+Section 9 comment: QQQ → TQQQ references updated throughout, threshold updated to 4%
+
+compute_sleeve_return docstring: added TQQQ inception guard documentation and the TQQQ → SPY redirect logic in the function body
+
+Both scorecards: calmar(...) line added after Sortino in both out-of-sample and holdout blocks
+
+Chart title and regime map subtitle: both updated to v4 (TQQQ / Asymmetric Smoothing)
+
 _________________________________________________________________
 How to Use:
 
