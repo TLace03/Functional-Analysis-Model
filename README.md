@@ -101,7 +101,9 @@ python FunctionalAnalysisModel.py
 
 For NewsAgent.py
 ***Install the optional LLM tier:***
+
 pip install anthropic
+
 set ANTHROPIC_API_KEY=your_key_here   # Windows
 # or
 export ANTHROPIC_API_KEY=your_key_here  # Mac/Linux
