@@ -60,7 +60,7 @@ CVAR_ALPHA  = 0.05      # Tail probability for CVaR (5% worst outcomes)
 TRAIN_FRAC  = 0.70      # Walk-forward train/test split fraction
 REGIME_CONFIRM_DAYS = 5 # Consecutive days new regime must persist before switching
 PHASE1B_MOM_THRESH  = 0.03  # 21-day SPY return threshold for Phase 1b upgrade
-SLEEVE_INSTRUMENTS  = ["SPY", "QQQ", "GLD", "SH", "SDS", "TLT"]
+SLEEVE_INSTRUMENTS  = ["SPY", "TQQQ", "GLD", "SH", "SDS", "TLT"]
 SDS_INCEPTION       = pd.Timestamp("2006-07-11")  # SDS launch date
 
 # ============================================================
@@ -664,19 +664,19 @@ phase_factor_weights = {
 # ============================================================
 
 phase_blend = {
-    1: {"FACTOR": 0.55, "SPY": 0.45, "QQQ": 0.00, "GLD": 0.00,
+    1: {"FACTOR": 0.55, "SPY": 0.45, "TQQQ": 0.00, "GLD": 0.00,
         "SH": 0.00, "SDS": 0.00, "TLT": 0.00},
 
-    "1b": {"FACTOR": 0.40, "SPY": 0.20, "QQQ": 0.40, "GLD": 0.00,
+    "1b": {"FACTOR": 0.40, "SPY": 0.20, "TQQQ": 0.40, "GLD": 0.00,
            "SH": 0.00, "SDS": 0.00, "TLT": 0.00},
 
-    2: {"FACTOR": 0.30, "SPY": 0.00, "QQQ": 0.70, "GLD": 0.00,
+    2: {"FACTOR": 0.30, "SPY": 0.00, "TQQQ": 0.70, "GLD": 0.00,
         "SH": 0.00, "SDS": 0.00, "TLT": 0.00},
 
-    3: {"FACTOR": 0.30, "SPY": 0.00, "QQQ": 0.00, "GLD": 0.20,
+    3: {"FACTOR": 0.30, "SPY": 0.00, "TQQQ": 0.00, "GLD": 0.20,
         "SH": 0.10, "SDS": 0.30, "TLT": 0.10},
 
-    4: {"FACTOR": 0.45, "SPY": 0.10, "QQQ": 0.00, "GLD": 0.20,
+    4: {"FACTOR": 0.45, "SPY": 0.10, "TQQQ": 0.00, "GLD": 0.20,
         "SH": 0.05, "SDS": 0.00, "TLT": 0.20},
 }
 
@@ -759,7 +759,7 @@ spy_cum  = (1 + spy_test).cumprod()
 # ============================================================
 print("\nPHASE BLEND ALLOCATION SUMMARY")
 print("=" * 80)
-print(f"{'Phase':<24} {'Factor':>8} {'SPY':>6} {'QQQ':>6} "
+print(f"{'Phase':<24} {'Factor':>8} {'SPY':>6} {'TQQQ':>6} "
       f"{'GLD':>6} {'SH':>6} {'SDS':>6} {'TLT':>6}")
 print("=" * 80)
 blend_display_map = [
@@ -773,7 +773,7 @@ for label_str, blend in blend_display_map:
     print(f"  Phase {label_str:<20} "
           f"{blend['FACTOR']*100:>7.0f}% "
           f"{blend['SPY']*100:>5.0f}% "
-          f"{blend['QQQ']*100:>5.0f}% "
+          f"{blend['TQQQ']*100:>5.0f}% "
           f"{blend['GLD']*100:>5.0f}% "
           f"{blend['SH']*100:>5.0f}% "
           f"{blend.get('SDS', 0)*100:>5.0f}% "
@@ -963,9 +963,6 @@ axes[1, 1].set_title("PCA Variance Explained")
 axes[1, 1].set_xlabel("Factor")
 axes[1, 1].set_ylabel("Variance Explained (%)")
 axes[1, 1].legend()
-
-plt.tight_layout()
-plt.show()
 
 plt.tight_layout()
 plt.show()
