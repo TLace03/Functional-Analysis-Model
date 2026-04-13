@@ -69,6 +69,19 @@ Both scorecards: calmar(...) line added after Sortino in both out-of-sample and 
 
 Chart title and regime map subtitle: both updated to v4 (TQQQ / Asymmetric Smoothing)
 
+Created and pushed FAMWithAIA.py
+
+NewsAgent.py — Architecture
+Four source tiers, in priority order:
+Tier 1 — Polymarket (gamma-api.polymarket.com, public REST, no auth): Fetches the top 300 active markets by volume, filters for macro-relevant keywords, and produces volume-weighted probability estimates for three signal buckets — recession_prob, fed_cut_prob, and war_escalation_prob. A market at 70% "Yes" for recession is more actionable than any number of news articles because that price represents capital committed to the view.
+Tier 2 — RSS feeds (stdlib urllib + xml.etree): MarketWatch, CNBC Economy, CNBC Finance, Federal Reserve press releases, and Yahoo Finance. No third-party parsers — zero new dependencies.
+Tier 3 — FOREX snapshot (yfinance, already a dependency): 5-day returns on DXY, EUR/USD, USD/JPY, USD/CNY. A surging dollar + strengthening yen is a composite risk-off signal that adjusts risk_on_score by up to ±15 percentage points.
+Tier 4 — Headline scoring: If ANTHROPIC_API_KEY is set, claude-haiku-4-5-20251001 scores the top 30 headlines into structured JSON (macro_sentiment, risk_on_score, geo_risk_score, top risks, top tailwinds). If the key is absent or the call fails, a deterministic weighted-keyword fallback using np.tanh normalisation runs instead. The model never blocks or fails on this tier.
+
+Changes to FunctionalAnalysisModel.py — exactly four edits:
+Block 1 (after warnings.filterwarnings): The import + initialisation block. Wrapped in try/except — if NewsAgent.py isn't in the same directory, the model runs exactly as before. _news_signal = None is the fallback.
+Block 2 (resolve_phase): After the existing Phase 1→1b momentum check, _news_signal.adjust_phase(base_phase, date) is called. The adjust_phase method has three rules: force Phase 3 if Polymarket recession >75%, demote Phase 1b to Phase 1 if recession >60%, and demote Phase 1b if news sentiment is strongly bearish. All three are no-ops for historical dates.
+Block 3 & 4 (backtest loop + holdout loop): After blend = phase_blend[eff_phase], _news_signal.adjust_blend(blend, date) is called. This applies marginal nudges — up to +6pp GLD for elevated geopolitical risk, +5pp TLT when Fed-cut probability is high, +5pp TQQQ when risk-on score is very strong in Phase 1 — each proportional to signal strength with no cliff edges. Again, no-op for historical dates.
 _________________________________________________________________
 How to Use:
 
@@ -76,7 +89,14 @@ How to Use:
 git clone https://github.com/TLace03/Functional-Analysis-Model.git
 
 # Install dependencies
-pip install numpy pandas yfinance matplotlib scipy scikit-learn
+pip install numpy pandas yfinance matplotlib scipy scikit-learn anthropic
 
 # Run the model
 python FunctionalAnalysisModel.py
+
+For NewsAgent.py
+***Install the optional LLM tier:***
+pip install anthropic
+set ANTHROPIC_API_KEY=your_key_here   # Windows
+# or
+export ANTHROPIC_API_KEY=your_key_here  # Mac/Linux
