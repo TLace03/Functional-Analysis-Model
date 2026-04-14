@@ -2421,7 +2421,7 @@ def run_live_paper_trading(rebalance_interval: int = 60, live_data: bool = False
         print(f"[Live] IB_PORT env var '{os.environ.get('IB_PORT')}' invalid — using 7497")
         port = 7497
     # parse client id robustly; fall back to default 101 if not numeric
-    client_id_env = os.environ.get("IB_CLIENT_ID", "DUQ210493")
+    client_id_env = os.environ.get("IB_CLIENT_ID", "Input_Personal_ID")
     if client_id_env is None or client_id_env == "":
         client_id = 101
     else:
