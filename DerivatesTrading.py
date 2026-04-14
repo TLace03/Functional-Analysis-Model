@@ -562,7 +562,10 @@ class DerivativesHedger:
             except Exception:
                 pass
 
-        return portfolio_daily_return + hedge_pnl
+        return (
+            portfolio_daily_return * (1 - hedge_ratio)
+            + hedge_pnl
+        )
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
