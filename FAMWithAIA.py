@@ -60,6 +60,9 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
+from matplotlib.lines import Line2D
+from matplotlib.dates import date2num
 from scipy.optimize import minimize
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
@@ -74,7 +77,111 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from joblib import Parallel, delayed
 from numba import njit
 import torch
+
+try:
+    import openpyxl
+    _HAS_OPENPYXL = True
+except ImportError:
+    _HAS_OPENPYXL = False
  
+def download_price_data(tickers, period, interval, chunk_size=50, retries=2, progress=False):
+    """
+    Download adjusted-close prices in parallel chunks, then merge.
+
+    KEY FIX — weekly interval timestamp alignment:
+    ──────────────────────────────────────────────
+    yfinance with interval="1wk" sometimes anchors weekly bars to
+    different days of the week across separate download calls
+    (e.g. chunk 1 returns Mondays, chunk 2 returns Fridays).
+    When those chunks are pd.concat'd on axis=1, pandas takes the
+    UNION of both date sets, producing ~2x as many rows as expected.
+    Every ticker then has ~50% NaN coverage, so all tickers fail
+    the 95% coverage threshold and the model falls back to 5 ETFs.
+
+    Fix — two steps applied after each chunk is extracted:
+      Step A: strip timezone and time-of-day from the DatetimeIndex
+              so Mondays and Fridays representing the same week are
+              not treated as different dates.
+              data.index = pd.to_datetime(data.index.date)
+
+      Step B: after all chunks are concatenated, resample to a
+              canonical weekly anchor (Friday close: "W-FRI") so
+              every ticker shares an identical weekly DatetimeIndex.
+              raw = raw.resample("W-FRI").last()
+    """
+    tickers = [t for t in dict.fromkeys(tickers) if isinstance(t, str) and t.strip()]
+    if not tickers:
+        return pd.DataFrame(), []
+
+    failed = []
+    frames = []
+    chunks = [tickers[i:i + chunk_size] for i in range(0, len(tickers), chunk_size)]
+    is_weekly = "wk" in str(interval).lower()
+
+    print(f"Downloading price data for {len(tickers)} tickers in {len(chunks)} chunks...")
+
+    for chunk in chunks:
+        for attempt in range(1, retries + 1):
+            try:
+                data = yf.download(
+                    chunk,
+                    period=period,
+                    interval=interval,
+                    auto_adjust=True,
+                    progress=progress,
+                )
+                if data is None or data.empty:
+                    raise ValueError("Empty download result")
+                if isinstance(data, pd.Series):
+                    data = data.to_frame()
+                if isinstance(data.columns, pd.MultiIndex):
+                    if "Close" in data.columns.levels[0]:
+                        data = data["Close"]
+                    else:
+                        data = data.droplevel(0, axis=1)
+                if data.empty:
+                    raise ValueError("No close price data")
+
+                # ── Step A: strip time-of-day and timezone ──────────────
+                # pd.DatetimeIndex can carry UTC offsets or intraday times.
+                # For weekly data, "2024-04-22 00:00:00-04:00" and
+                # "2024-04-19 00:00:00+00:00" represent the same week but
+                # compare as different keys.  Convert to plain dates so
+                # all chunks share a common calendar representation.
+                data.index = pd.to_datetime(data.index.date)
+
+                frames.append(data)
+                break
+            except Exception as e:
+                msg = str(e)
+                if attempt == retries:
+                    print(f"  Chunk failed after {retries} attempts: {chunk} -> {msg}")
+                    failed.extend(chunk)
+                else:
+                    print(f"  Retry {attempt}/{retries} for chunk {chunk} due to {msg}")
+
+    if frames:
+        raw = pd.concat(frames, axis=1)
+        raw = raw.loc[:, ~raw.columns.duplicated()]
+    else:
+        raw = pd.DataFrame()
+
+    if isinstance(raw.columns, pd.MultiIndex) and "Close" in raw.columns.levels[0]:
+        raw = raw["Close"]
+
+    # ── Step B: canonical weekly resample ──────────────────────────────
+    # Even after Step A, two chunks might have Monday vs Friday dates for
+    # the same ISO week.  Resampling to "W-FRI" (Friday close) collapses
+    # all rows within the same calendar week to a single Friday date.
+    # This produces one consistent row per week for every ticker.
+    # ".last()" picks the last available price in the week (closest to Fri).
+    # Rows where ALL tickers are NaN (e.g. market holidays) are dropped.
+    if is_weekly and not raw.empty:
+        raw = raw.resample("W-FRI").last()
+        raw = raw.dropna(how="all")
+
+    return raw, failed
+
 sys.stdout.reconfigure(encoding="utf-8")
 warnings.filterwarnings("ignore")
  
@@ -116,10 +223,15 @@ except Exception as _news_err:
 # ============================================================
 # DERIVATIVES HEDGER — protective put overlay for drawdowns
 # ============================================================
+# With leverage now active in Phases 1-2 (up to 5x), we increase
+# the base hedge ratio to 0.75.  When leverage is detected,
+# DerivativesHedger will double this to 1.50, then cap at 1.0.
+# This ensures robust downside protection during leveraged periods.
 try:
     from DerivativesTrading import DerivativesHedger
-    _hedger = DerivativesHedger(hedge_ratio=0.50)
-    print("  [DerivativesHedger] Initialized — protective puts active in Phase 3 / drawdowns.")
+    _hedger = DerivativesHedger(hedge_ratio=0.75)
+    print("  [DerivativesHedger] Initialized (base 75% with adaptive scaling for leverage).")
+    print("  [DerivativesHedger] Leverage + dynamic hedging active in Phases 1/1b/2.")
 except Exception as _hedge_err:
     print(f"  [DerivativesHedger] Unavailable ({_hedge_err}) — running without derivatives overlay.")
     _hedger = None
@@ -143,23 +255,87 @@ except Exception as _hedge_err:
 # ============================================================
 # CONFIG
 # ============================================================
-PERIOD      = "50y"
+PERIOD      = "23y"
 INTERVAL    = "1d"
-RF_RATE     = 0.03 / 252
-N_FACTORS   = 20
+N_FACTORS   = 15
 MIN_WEIGHT  = 0.0
 MAX_WEIGHT  = 0.10
-CVAR_ALPHA  = 0.05
-TRAIN_FRAC  = 0.70
+CVAR_ALPHA  = 0.10
+TRAIN_FRAC  = 0.5
 REGIME_CONFIRM_DAYS = 5
 PHASE1B_MOM_THRESH  = 0.03
-SLEEVE_INSTRUMENTS  = ["SPY", "TQQQ", "GLD", "SH", "SDS", "TLT"]
+SLEEVE_INSTRUMENTS  = ["SPY", "TQQQ", "GLD", "SH", "SDS", "TLT", "BTC-USD"]
 SDS_INCEPTION       = pd.Timestamp("2006-07-11")
- 
-# Chunk size for parallel ticker downloads.
-# ~100 tickers per chunk avoids yfinance rate-limit timeouts while
-# keeping the number of parallel requests manageable.
-DOWNLOAD_CHUNK_SIZE = 100
+
+# Actual fund leverage multipliers used for exposure control.
+# This is separate from capital allocation weights.
+SLEEVE_LEVERAGE     = {
+    "SPY":    1.0,
+    "TQQQ":   3.0,
+    "GLD":    1.0,
+    "SH":    -1.0,
+    "SDS":   -2.0,
+    "TLT":    1.0,
+    "BTC-USD":1.0,
+}
+MAX_EFFECTIVE_EXPOSURE = np.inf
+
+# ── LEVERAGE CONFIGURATION ──────────────────────────────────
+# Phase leverage now defines the maximum allowed gross exposure for
+# the portfolio during that phase. The model will scale exposures
+# down if the raw portfolio would exceed the phase cap.
+LEVERAGE_CONFIG = {
+    1: 3.0,      # Phase 1 (Growth/Buildout): max 3x exposure
+    "1b": 3.0,  # Phase 1b (Momentum Accel): max 3x exposure
+    2: 5.0,      # Phase 2 (Narrative/Momentum): max 5x exposure
+    3: 1.0,      # Phase 3 (Unwind): max 1x exposure
+    4: 1.5,      # Phase 4 (Reset): max 1.5x exposure
+}
+
+# ── Interval-aware bar count ────────────────────────────────────────────────
+# BARS_PER_YEAR drives ALL time-scale-dependent constants in the model:
+#   - Annualisation multipliers for Sharpe, Sortino, portfolio_performance
+#   - Risk-free rate per bar  (RF_RATE)
+#   - Lookback windows in the regime classifier
+#
+# Original code hardcoded 252 (trading days/year) everywhere.
+# With INTERVAL="1wk", one bar = 1 week, so using 252 meant:
+#   pct_change(63) = 63-WEEK lookback ≈ 14 months  (intended: 3 months)
+#   np.sqrt(252)   = annualisation for daily data   (off by sqrt(252/52) ≈ 2.2×)
+#   RF_RATE/252    = daily risk-free rate used weekly (hurdle 5× too small)
+_interval_lower = INTERVAL.lower().replace(" ", "")
+if _interval_lower in ("1m", "1min", "1minute"):
+    BARS_PER_YEAR = 252 * 6.5 * 60   # 252 trading days × 6.5 hours/day × 60 minutes/hour
+elif _interval_lower in ("5m", "5min", "5minute"):
+    BARS_PER_YEAR = 252 * 6.5 * 12   # 252 trading days × 6.5 hours/day × 12 five-minute bars/hour
+elif _interval_lower in ("15m", "15min", "15minute"):
+    BARS_PER_YEAR = 252 * 6.5 * 4    # 252 trading days × 6.5 hours/day × 4 fifteen-minute bars/hour
+elif _interval_lower in ("30m", "30min", "30minute"):
+    BARS_PER_YEAR = 252 * 6.5 * 2    # 252 trading days × 6.5 hours/day × 2 thirty-minute bars/hour
+elif _interval_lower in ("60m", "60min", "60minute", "1h", "1hr", "1hour"):
+    BARS_PER_YEAR = 252 * 6.5        # 252 trading days × 6.5 hours/day × 1 sixty-minute bar/hour
+elif _interval_lower in ("90m", "90min", "90minute"):
+    BARS_PER_YEAR = 252 * 6.5 * (60 / 90)  # 252 trading days × 6.5 hours/day × (60/90) ninety-minute bars/hour
+elif _interval_lower in ("4h", "4hr", "4hour"):
+    BARS_PER_YEAR = 252 * 6.5 * (60 / 240) # 252 trading days × 6.5 hours/day × (60/240) four-hour bars/hour
+elif  _interval_lower in ("1d",  "1day"):    BARS_PER_YEAR = 252
+elif _interval_lower in ("1wk", "1w"):      BARS_PER_YEAR = 52
+elif _interval_lower in ("1mo", "1month"):  BARS_PER_YEAR = 12
+else:                                        BARS_PER_YEAR = 252   # safe default
+
+# Risk-free rate per bar.  Always annual rate / bars per year.
+RF_RATE = 0.03 / BARS_PER_YEAR
+
+# Regime-classifier lookback windows scaled to the selected interval.
+# Economic durations are preserved regardless of bar frequency:
+#   3-month momentum  : BARS_PER_YEAR / 4   →  63 bars daily /  13 bars weekly
+#   1-month momentum  : BARS_PER_YEAR / 12  →  21 bars daily /   4 bars weekly
+#   Long VIX window   : BARS_PER_YEAR / 4   →  60 bars daily /  13 bars weekly
+#   Short VIX window  : BARS_PER_YEAR / 12  →  20 bars daily /   4 bars weekly
+MOM_SLOW_BARS  = max(2, int(BARS_PER_YEAR / 4))    # ~3-month momentum
+MOM_FAST_BARS  = max(2, int(BARS_PER_YEAR / 12))   # ~1-month momentum
+VIX_LONG_BARS  = max(4, int(BARS_PER_YEAR / 4))    # long VIX rolling window
+VIX_SHORT_BARS = max(2, int(BARS_PER_YEAR / 12))   # short VIX rolling window
  
 # ============================================================
 # SECTION 1 — CONSTITUENT DOWNLOAD
@@ -236,70 +412,87 @@ all_tickers = {
 print(f"Total unique tickers: {len(all_tickers)}")
  
 # ============================================================
-# SECTION 2 — CHUNKED PARALLEL PRICE DOWNLOAD
+# SECTION 2 — PRICE DOWNLOAD
 # ============================================================
-# OPTIMIZATION: Previously a single yfinance.download() call for
-# 500+ tickers.  That single call frequently hangs or partially
-# fails because the Yahoo Finance API has undocumented rate limits.
-#
-# Fix: Split the ticker list into DOWNLOAD_CHUNK_SIZE batches and
-# download each chunk in a separate thread.  ThreadPoolExecutor
-# manages N_IO_THREADS simultaneous HTTP sessions; yfinance
-# releases the GIL during network I/O so threads run truly
-# concurrently (this is I/O parallelism, not CPU parallelism).
-#
-# After all chunks complete, we concatenate the DataFrames along
-# the column axis and apply the same quality filter as before.
- 
-def _download_chunk(chunk: list) -> pd.DataFrame:
-    """
-    Download adjusted-close prices for one batch of tickers.
-    Returns a DataFrame with dates as rows, tickers as columns.
-    Returns an empty DataFrame on failure so the caller can skip it.
-    """
-    try:
-        df = yf.download(
-            chunk,
-            period=PERIOD,
-            interval=INTERVAL,
-            auto_adjust=True,
-            progress=False
-        )["Close"]
-        # yfinance may return a Series when only one ticker succeeds
-        if isinstance(df, pd.Series):
-            df = df.to_frame(name=chunk[0])
-        return df
-    except Exception:
-        return pd.DataFrame()
- 
-ticker_list  = sorted(all_tickers)
-chunks       = [ticker_list[i : i + DOWNLOAD_CHUNK_SIZE]
-                for i in range(0, len(ticker_list), DOWNLOAD_CHUNK_SIZE)]
- 
-print(f"Downloading price data in {len(chunks)} parallel chunks "
-      f"({N_IO_THREADS} threads)...")
- 
-chunk_frames = []
-# as_completed() lets us process results as they arrive, so a slow
-# chunk doesn't block us from using fast chunks.
-with ThreadPoolExecutor(max_workers=N_IO_THREADS) as executor:
-    future_map = {executor.submit(_download_chunk, chunk): chunk
-                  for chunk in chunks}
-    for future in as_completed(future_map):
-        df = future.result()
-        if not df.empty:
-            chunk_frames.append(df)
- 
-# Merge all chunks: align on date index, fill any gaps, drop bad tickers
-raw = pd.concat(chunk_frames, axis=1)
- 
-# Collapse any duplicate columns that can arise from multi-chunk concat
-raw = raw.loc[:, ~raw.columns.duplicated()]
- 
+# We keep parallelism everywhere else (NewsAgent, optimization, backtest),
+
+
+print("Downloading price data...")
+
+raw, failed_tickers = download_price_data(
+    list(all_tickers),
+    period=PERIOD,
+    interval=INTERVAL,
+    chunk_size=60,
+    retries=2,
+    progress=True,
+)
+
+if failed_tickers:
+    print(f"Failed downloads for {len(failed_tickers)} tickers: {failed_tickers}")
+
+if raw.empty or raw.shape[1] == 0:
+    fallback_universe = ["SPY", "QQQ", "DIA", "IWM", "TLT", "GLD"]
+    print("Primary universe download returned zero valid tickers. Falling back to core ETFs:", fallback_universe)
+    raw, fallback_failed = download_price_data(
+        fallback_universe,
+        period=PERIOD,
+        interval=INTERVAL,
+        chunk_size=6,
+        retries=2,
+        progress=False,
+    )
+    if fallback_failed:
+        print(f"  Fallback failed for: {fallback_failed}")
+    if raw.empty or raw.shape[1] == 0:
+        raise ValueError(
+            "No valid price data could be downloaded for the main or fallback universe. "
+            "Check your internet connection and yfinance availability."
+        )
+    print(f"Using fallback tickers: {list(raw.columns)}")
+
 threshold = 0.05
-raw = raw.dropna(thresh=int(len(raw) * (1 - threshold)), axis=1)
-raw = raw.ffill().dropna()
- 
+min_required = int(len(raw) * (1 - threshold))
+coverage = raw.notna().sum(axis=0)
+valid_columns = coverage[coverage >= min_required].index
+if len(valid_columns) == 0:
+    print(
+        "No tickers met the coverage threshold for the primary universe. "
+        "Falling back to core ETFs."
+    )
+    raw, fallback_failed = download_price_data(
+        ["SPY", "QQQ", "DIA", "IWM", "TLT", "GLD"],
+        period=PERIOD,
+        interval=INTERVAL,
+        chunk_size=6,
+        retries=2,
+        progress=False,
+    )
+    if fallback_failed:
+        print(f"  Fallback failed for: {fallback_failed}")
+    if raw.empty or raw.shape[1] == 0:
+        raise ValueError(
+            "No valid price data could be downloaded for the main or fallback universe. "
+            "Check your internet connection and yfinance availability."
+        )
+    print(f"Using fallback tickers: {list(raw.columns)}")
+    min_required = int(len(raw) * (1 - threshold))
+    coverage = raw.notna().sum(axis=0)
+    valid_columns = coverage[coverage >= min_required].index
+    if len(valid_columns) == 0:
+        raise ValueError(
+            "Fallback universe also failed to meet the coverage threshold. "
+            "Try a smaller interval, a lower threshold, or a different universe."
+        )
+
+raw = raw[valid_columns]
+raw = raw.ffill().bfill().dropna()
+if raw.shape[1] == 0:
+    raise ValueError(
+        "No price columns remain after filtering. "
+        "Lower the threshold or use a smaller universe of more reliable tickers."
+    )
+
 print(f"Clean tickers after filtering: {raw.shape[1]}")
 print(f"Trading days: {raw.shape[0]}")
  
@@ -307,7 +500,15 @@ print(f"Trading days: {raw.shape[0]}")
 # SECTION 3 — RETURNS + SLEEVE INSTRUMENTS
 # ============================================================
 returns = raw.pct_change().dropna()
- 
+if isinstance(returns, pd.Series):
+    returns = returns.to_frame()
+
+if returns.empty:
+    raise ValueError(
+        "No return data available after price cleaning. "
+        "Check the yfinance download, the dropna threshold, and the selected symbols."
+    )
+
 print("Downloading instrument sleeves...")
 sleeve_raw = yf.download(
     SLEEVE_INSTRUMENTS,
@@ -320,9 +521,16 @@ sleeve_raw = yf.download(
 if isinstance(sleeve_raw.columns, pd.MultiIndex):
     sleeve_raw.columns = sleeve_raw.columns.droplevel(1)
  
-sleeve_raw     = sleeve_raw.ffill().dropna()
-sleeve_returns = sleeve_raw.pct_change().dropna()
-sleeve_returns = sleeve_returns.reindex(returns.index).dropna()
+sleeve_raw = sleeve_raw.ffill()
+# ── Why fillna(0.0) instead of dropna() ────────────────────────────────────
+# TQQQ (launched 2010) and SDS (launched 2006) have NaN returns for every
+# date before their IPO.  dropna() on a multi-column DataFrame removes ANY
+# row where even one column is NaN, so all pre-2010 dates get silently
+# stripped.  The vectorized backtest then raises KeyError when it looks up
+# those dates.  fillna(0.0) is semantically correct: a sleeve instrument that
+# doesn't exist yet contributes 0% return for that period.
+sleeve_returns = sleeve_raw.pct_change().fillna(0.0)
+sleeve_returns = sleeve_returns.reindex(returns.index, fill_value=0.0)
 print(f"Sleeve instruments loaded: {list(sleeve_returns.columns)}")
  
 vix_raw = yf.download("^VIX", period=PERIOD, interval=INTERVAL,
@@ -380,12 +588,17 @@ def classify_regime(vix_series: pd.Series,
     Returns (regime_series, spy_mom_fast_series)
     """
     # ── Momentum and rolling vol statistics ──────────────────
-    spy_mom      = spy_series.pct_change(63)
-    spy_mom_fast = spy_series.pct_change(21)
-    vix_sma60    = vix_series.rolling(60).mean()
-    vix_sma20    = vix_series.rolling(20).mean()
-    vix_std60    = vix_series.rolling(60).std()
-    vix_std20    = vix_series.rolling(20).std()
+    # Lookback windows are driven by MOM_SLOW_BARS / MOM_FAST_BARS /
+    # VIX_LONG_BARS / VIX_SHORT_BARS, which are derived from BARS_PER_YEAR
+    # in the CONFIG section.  This makes the classifier correct for both
+    # daily (pct_change(63) = 3 months) and weekly (pct_change(13) = 3 months)
+    # data without any manual re-tuning.
+    spy_mom      = spy_series.pct_change(MOM_SLOW_BARS)
+    spy_mom_fast = spy_series.pct_change(MOM_FAST_BARS)
+    vix_sma60    = vix_series.rolling(VIX_LONG_BARS).mean()
+    vix_sma20    = vix_series.rolling(VIX_SHORT_BARS).mean()
+    vix_std60    = vix_series.rolling(VIX_LONG_BARS).std()
+    vix_std20    = vix_series.rolling(VIX_SHORT_BARS).std()
  
     # Blended VIX z-score (equal weight of 60-day and 20-day lookbacks)
     vix_zscore = (
@@ -505,10 +718,44 @@ for phase, count in phase_counts.items():
 print("=" * 35)
  
 # ── Walk-forward split ────────────────────────────────────────
-split_date    = returns.index[int(len(returns) * TRAIN_FRAC)]
-train_returns = returns[returns.index <= split_date]
-test_returns  = returns[returns.index >  split_date]
- 
+if len(returns) < 2:
+    raise ValueError(
+        "Insufficient return data for a train/test split. "
+        f"Need at least 2 rows, got {len(returns)}."
+    )
+
+split_index = min(max(1, int(len(returns) * TRAIN_FRAC)), len(returns) - 1)
+split_date = returns.index[split_index]
+train_returns = returns.iloc[: split_index + 1]
+test_returns = returns.iloc[split_index + 1 :]
+
+if train_returns.empty or test_returns.empty:
+    raise ValueError(
+        "Walk-forward split produced an empty training or test set. "
+        f"Train rows: {len(train_returns)}, Test rows: {len(test_returns)}, "
+        f"split_date: {split_date}."
+    )
+
+if train_returns.shape[1] == 0:
+    raise ValueError(
+        "No asset columns remain after data cleaning. "
+        "Ensure the downloaded price data contains valid tickers and that dropna thresholds are not too strict."
+    )
+
+max_components = min(train_returns.shape)
+if max_components < 1:
+    raise ValueError(
+        "Insufficient training data for PCA factor extraction. "
+        f"Training data shape is {train_returns.shape}."
+    )
+
+if N_FACTORS > max_components:
+    print(
+        f"Reducing N_FACTORS from {N_FACTORS} to {max_components} "
+        f"because the training dataset only supports {max_components} PCA components."
+    )
+    N_FACTORS = max_components
+
 print(f"\nWalk-forward split:")
 print(f"  Train: {returns.index[0].date()} → {split_date.date()}")
 print(f"  Test:  {split_date.date()} → {returns.index[-1].date()}")
@@ -559,7 +806,7 @@ def factor_weights_to_stock_weights(factor_weights: np.ndarray,
       w_stock = clip(w_factors · loadings, min=0)  (long-only)
       w_stock /= sum(w_stock)                        (normalize to 1)
  
-    The dot product (1×F) · (F×N) = (1×N) maps factor positions
+    The dot product (1xF) · (FxN) = (1xN) maps factor positions
     to stock positions.  Clipping to zero enforces the long-only
     constraint without short selling.
     """
@@ -716,10 +963,10 @@ sim_prices, sim_vols = bates_simulate(S0=spy_price, **params, paths=500)
 # ============================================================
 def portfolio_performance(weights, ret_matrix):
     weights     = np.array(weights)
-    port_return = np.dot(weights, ret_matrix.mean()) * 252
-    cov         = ret_matrix.cov() * 252
+    port_return = np.dot(weights, ret_matrix.mean()) * BARS_PER_YEAR
+    cov         = ret_matrix.cov() * BARS_PER_YEAR
     port_vol    = np.sqrt(weights @ cov @ weights)
-    port_sharpe = (port_return - RF_RATE * 252) / (port_vol + 1e-10)
+    port_sharpe = (port_return - RF_RATE * BARS_PER_YEAR) / (port_vol + 1e-10)
     return port_return, port_vol, port_sharpe
  
 def max_drawdown(cum_series):
@@ -727,13 +974,13 @@ def max_drawdown(cum_series):
  
 def sharpe(ret_series):
     excess = ret_series - RF_RATE
-    return (excess.mean() / (excess.std() + 1e-10)) * np.sqrt(252)
+    return (excess.mean() / (excess.std() + 1e-10)) * np.sqrt(BARS_PER_YEAR)
  
 def sortino(ret_series):
     excess   = ret_series - RF_RATE
     downside = excess[excess < 0]
-    down_std = (downside.std() * np.sqrt(252)) if len(downside) > 1 else 1e-10
-    return (excess.mean() * 252) / (down_std + 1e-10)
+    down_std = (downside.std() * np.sqrt(BARS_PER_YEAR)) if len(downside) > 1 else 1e-10
+    return (excess.mean() * BARS_PER_YEAR) / (down_std + 1e-10)
  
 def compute_cvar(port_rets, alpha=CVAR_ALPHA):
     """
@@ -923,22 +1170,34 @@ phase_factor_weights = {
 # ============================================================
 # SECTION 9 — BLEND DEFINITIONS
 # ============================================================
+def validate_blend(blend: dict) -> dict:
+    """Normalize phase blend weights to a true 100% capital allocation."""
+    total = sum(blend.values())
+    if abs(total - 1.0) > 1e-8 and total != 0.0:
+        normalized = {k: v / total for k, v in blend.items()}
+        print(f"  [Blend Validation] normalizing blend weights from {total:.4f} to 1.0000")
+        return normalized
+    if total == 0.0:
+        raise ValueError("Phase blend weights sum to zero — cannot normalize blend.")
+    return blend
+
 phase_blend = {
-    1: {"FACTOR": 0.55, "SPY": 0.45, "TQQQ": 0.00, "GLD": 0.00,
-        "SH": 0.00, "SDS": 0.00, "TLT": 0.00},
+    1: {"FACTOR": 0.75, "SPY": 0.00, "TQQQ": 0.10, "GLD": 0.00,
+        "SH": 0.00, "SDS": 0.05, "TLT": 0.00, "BTC-USD": 0.10},
  
-    "1b": {"FACTOR": 0.40, "SPY": 0.20, "TQQQ": 0.40, "GLD": 0.00,
-           "SH": 0.00, "SDS": 0.00, "TLT": 0.00},
+    "1b": {"FACTOR": 0.75, "SPY": 0.00, "TQQQ": 0.10, "GLD": 0.00,
+           "SH": 0.00, "SDS": 0.05, "TLT": 0.00, "BTC-USD": 0.10},
  
-    2: {"FACTOR": 0.30, "SPY": 0.00, "TQQQ": 0.70, "GLD": 0.00,
-        "SH": 0.00, "SDS": 0.00, "TLT": 0.00},
+    2: {"FACTOR": 0.75, "SPY": 0.00, "TQQQ": 0.10, "GLD": 0.00,
+        "SH": 0.00, "SDS": 0.00, "TLT": 0.00, "BTC-USD": 0.15},
  
-    3: {"FACTOR": 0.30, "SPY": 0.00, "TQQQ": 0.00, "GLD": 0.20,
-        "SH": 0.10, "SDS": 0.30, "TLT": 0.10},
+    3: {"FACTOR": 0.20, "SPY": 0.00, "TQQQ": 0.00, "GLD": 0.20,
+        "SH": 0.10, "SDS": 0.35, "TLT": 0.15, "BTC-USD": 0.00},
  
-    4: {"FACTOR": 0.45, "SPY": 0.10, "TQQQ": 0.00, "GLD": 0.20,
-        "SH": 0.05, "SDS": 0.00, "TLT": 0.20},
+    4: {"FACTOR": 0.75, "SPY": 0.00, "TQQQ": 0.05, "GLD": 0.15,
+        "SH": 0.00, "SDS": 0.00, "TLT": 0.00, "BTC-USD": 0.05},
 }
+phase_blend = {k: validate_blend(v) for k, v in phase_blend.items()}
  
 # ============================================================
 # SLEEVE + PHASE RESOLUTION HELPERS
@@ -986,6 +1245,73 @@ def resolve_phase(date, base_phase):
     return base_phase
  
  
+def _save_portfolio_audit(audit_df: pd.DataFrame, label: str) -> None:
+    """Save the audit trail for later inspection."""
+    path = f"portfolio_audit_{label}.csv"
+    audit_df.to_csv(path, index=False)
+    print(f"Saved portfolio audit trail to {path}")
+
+    if _HAS_OPENPYXL:
+        excel_path = f"portfolio_audit_{label}.xlsx"
+        with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+            audit_df.to_excel(writer, sheet_name="Audit", index=False)
+            phase_summary = audit_df.groupby("phase").agg(
+                days=("date", "size"),
+                avg_gross_exposure=("effective_gross_exposure", "mean"),
+                avg_net_exposure=("effective_net_exposure", "mean"),
+                avg_scale=("exposure_scale", "mean"),
+                avg_phase_cap=("phase_cap", "mean"),
+                cap_exceed_days=("phase_cap_exceeded", "sum"),
+                avg_leverage=("phase_leverage", "mean"),
+                avg_unlevered_return=("return_before_leverage", "mean"),
+                avg_levered_return=("return_after_leverage", "mean"),
+                avg_hedge_pnl=("hedge_pnl", "mean"),
+                hedge_days=("hedge_applied", "sum"),
+            )
+            phase_summary.to_excel(writer, sheet_name="Phase_Summary")
+            key_columns = [
+                "date", "phase", "phase_action", "phase_reason",
+                "phase_cap", "phase_cap_exceeded", "raw_gross_exposure",
+                "raw_net_exposure", "effective_gross_exposure",
+                "effective_net_exposure", "factor_allocation",
+                "alloc_SPY", "alloc_TQQQ", "alloc_GLD", "alloc_SH",
+                "alloc_SDS", "alloc_TLT", "alloc_BTC_USD",
+                "hedge_pnl", "hedge_applied"
+            ]
+            key_columns = [c for c in key_columns if c in audit_df.columns]
+            audit_df[key_columns].to_excel(writer, sheet_name="Key_Drivers", index=False)
+        print(f"Saved portfolio audit workbook to {excel_path}")
+    else:
+        print("openpyxl unavailable; skipping Excel audit export.")
+ 
+ 
+def _print_portfolio_audit_summary(audit_df: pd.DataFrame, label: str) -> None:
+    """Print a compact exposure and contribution summary for the audit trail."""
+    audit_df = audit_df.copy()
+    if "date" not in audit_df.columns and audit_df.index.name == "date":
+        audit_df = audit_df.reset_index()
+    if "date" not in audit_df.columns:
+        audit_df["date"] = pd.NaT
+ 
+    print(f"\nPORTFOLIO AUDIT SUMMARY — {label}")
+    print("=" * 80)
+    phase_stats = audit_df.groupby("phase").agg(
+        days=("date", "size"),
+        avg_gross_exposure=("effective_gross_exposure", "mean"),
+        avg_net_exposure=("effective_net_exposure", "mean"),
+        avg_scale=("exposure_scale", "mean"),
+        avg_phase_cap=("phase_cap", "mean"),
+        cap_exceed_days=("phase_cap_exceeded", "sum"),
+        avg_leverage=("phase_leverage", "mean"),
+        avg_unlevered_return=("return_before_leverage", "mean"),
+        avg_levered_return=("return_after_leverage", "mean"),
+        avg_hedge_pnl=("hedge_pnl", "mean"),
+        hedge_days=("hedge_applied", "sum"),
+    )
+    print(phase_stats.to_string(float_format=lambda x: f"{x:,.4f}"))
+    print("=" * 80)
+ 
+ 
 # ============================================================
 # VECTORIZED BACKTEST HELPER
 # ============================================================
@@ -1020,10 +1346,15 @@ def _compute_portfolio_returns_vectorized(
         regime_slice: pd.Series,
         sleeve_df: pd.DataFrame,
         spy_series: pd.Series,
-) -> pd.Series:
+) -> tuple[pd.Series, pd.DataFrame]:
     """
     Compute daily blended portfolio returns for an entire date range
     using grouped matrix operations.
+
+    Returns
+    -------
+    portfolio_daily : pd.Series of daily portfolio returns
+    portfolio_audit : pd.DataFrame of per-date exposure and contribution metrics
  
     Parameters
     ----------
@@ -1038,6 +1369,40 @@ def _compute_portfolio_returns_vectorized(
     """
     dates = ret_df.index
     n     = len(dates)
+ 
+    audit = {
+        "date": np.array(dates, dtype="datetime64[ns]"),
+        "phase": np.empty(n, dtype=object),
+        "factor_return": np.zeros(n, dtype=np.float64),
+        "sleeve_return": np.zeros(n, dtype=np.float64),
+        "factor_contrib": np.zeros(n, dtype=np.float64),
+        "sleeve_contrib": np.zeros(n, dtype=np.float64),
+        "exposure_scale": np.ones(n, dtype=np.float64),
+        "raw_gross_exposure": np.zeros(n, dtype=np.float64),
+        "raw_net_exposure": np.zeros(n, dtype=np.float64),
+        "effective_gross_exposure": np.zeros(n, dtype=np.float64),
+        "effective_net_exposure": np.zeros(n, dtype=np.float64),
+        "phase_cap": np.ones(n, dtype=np.float64),
+        "phase_cap_exceeded": np.zeros(n, dtype=bool),
+        "phase_reason": np.full(n, "", dtype=object),
+        "phase_action": np.full(n, "", dtype=object),
+        "factor_allocation": np.zeros(n, dtype=np.float64),
+        "alloc_SPY": np.zeros(n, dtype=np.float64),
+        "alloc_TQQQ": np.zeros(n, dtype=np.float64),
+        "alloc_GLD": np.zeros(n, dtype=np.float64),
+        "alloc_SH": np.zeros(n, dtype=np.float64),
+        "alloc_SDS": np.zeros(n, dtype=np.float64),
+        "alloc_TLT": np.zeros(n, dtype=np.float64),
+        "alloc_BTC_USD": np.zeros(n, dtype=np.float64),
+        "phase_leverage": np.ones(n, dtype=np.float64),
+        "return_before_leverage": np.zeros(n, dtype=np.float64),
+        "return_after_leverage": np.zeros(n, dtype=np.float64),
+        "hedge_pnl": np.zeros(n, dtype=np.float64),
+        "return_after_hedge": np.zeros(n, dtype=np.float64),
+        "hedge_applied": np.zeros(n, dtype=bool),
+        "spy_return": np.zeros(n, dtype=np.float64),
+        "qqq_return": np.zeros(n, dtype=np.float64),
+    }
  
     # ── Step 1: Vectorized phase computation ─────────────────
     # Build a pandas Series of effective phase keys (1/"1b"/2/3/4)
@@ -1071,6 +1436,10 @@ def _compute_portfolio_returns_vectorized(
  
     # ── Step 2: Pre-compute sleeve weight vectors (one per phase) ─
     sleeve_cols = sleeve_df.columns
+    sleeve_leverage = np.array(
+        [SLEEVE_LEVERAGE.get(col, 1.0) for col in sleeve_cols],
+        dtype=np.float64,
+    )
     sleeve_vecs = {}
     for ph in eff_phases.unique():
         # Normalise key type: "1b" stays as string, others become int
@@ -1104,8 +1473,8 @@ def _compute_portfolio_returns_vectorized(
             continue
  
         # (n_phase_dates × n_stocks) @ (n_stocks,) → (n_phase_dates,)
-        # This is ONE BLAS DGEMV call for ALL dates in this phase group.
-        factor_rets = ret_df.loc[ph_dates].values @ f_w
+        # reindex instead of .loc[] for the same defensive reason as below.
+        factor_rets = ret_df.reindex(ph_dates, fill_value=0.0).values @ f_w
  
         # (n_phase_dates × n_sleeves) @ (n_sleeves,) → (n_phase_dates,)
         # Pre-2006: SDS → SH substitution
@@ -1114,18 +1483,70 @@ def _compute_portfolio_returns_vectorized(
  
         sv_post = sleeve_vecs[(ph, "post")]
         sv_pre  = sleeve_vecs[(ph, "pre")]
- 
+        phase_cap = LEVERAGE_CONFIG.get(ph_key, 1.0)
+
+        # ── reindex instead of .loc[] ────────────────────────────
+        # .loc[] raises KeyError for dates absent from sleeve_df
+        # (e.g. pre-TQQQ era, calendar mismatches between the main
+        # returns index and the ETF trading calendar).
+        # .reindex(..., fill_value=0.0) silently returns 0 for any
+        # missing date — instrument not trading = 0% return.
         sleeve_rets = np.zeros(len(ph_dates))
+        factor_contrib = blend["FACTOR"] * factor_rets
+        exposure_abs = np.ones(len(ph_dates), dtype=np.float64) * blend["FACTOR"]
+        exposure_net = np.ones(len(ph_dates), dtype=np.float64) * blend["FACTOR"]
+        raw_exposure_abs = np.ones(len(ph_dates), dtype=np.float64) * blend["FACTOR"]
+        raw_exposure_net = np.ones(len(ph_dates), dtype=np.float64) * blend["FACTOR"]
+        scale_arr = np.ones(len(ph_dates), dtype=np.float64)
+        phase_reason = np.full(len(ph_dates), "Within cap", dtype=object)
+        sleeve_positions = np.zeros((len(ph_dates), len(sleeve_cols)), dtype=np.float64)
+
         if post_mask.any():
             sleeve_rets[post_mask] = (
-                sleeve_df.loc[ph_dates[post_mask]].values @ sv_post
+                sleeve_df.reindex(ph_dates[post_mask], fill_value=0.0).values @ sv_post
             )
+            effective_post = blend["FACTOR"] + np.dot(np.abs(sv_post), np.abs(sleeve_leverage))
+            raw_exposure_abs[post_mask] = effective_post
+            raw_exposure_net[post_mask] = blend["FACTOR"] + np.dot(sv_post, sleeve_leverage)
+            sleeve_positions[post_mask, :] = np.outer(
+                np.ones(post_mask.sum(), dtype=np.float64),
+                sv_post * sleeve_leverage
+            )
+            exposure_abs[post_mask] = effective_post
+            exposure_net[post_mask] = raw_exposure_net[post_mask]
+            if effective_post > phase_cap:
+                scale = phase_cap / effective_post
+                scale_arr[post_mask] *= scale
+                sleeve_rets[post_mask] *= scale
+                factor_contrib[post_mask] *= scale
+                exposure_abs[post_mask] *= scale
+                exposure_net[post_mask] *= scale
+                sleeve_positions[post_mask, :] *= scale
+                phase_reason[post_mask] = "Phase cap exceeded"
+
         if pre_mask.any():
             sleeve_rets[pre_mask] = (
-                sleeve_df.loc[ph_dates[pre_mask]].values @ sv_pre
+                sleeve_df.reindex(ph_dates[pre_mask], fill_value=0.0).values @ sv_pre
             )
- 
-        # News blend adjustment (live dates only, at most 5 iterations)
+            effective_pre = blend["FACTOR"] + np.dot(np.abs(sv_pre), np.abs(sleeve_leverage))
+            raw_exposure_abs[pre_mask] = effective_pre
+            raw_exposure_net[pre_mask] = blend["FACTOR"] + np.dot(sv_pre, sleeve_leverage)
+            sleeve_positions[pre_mask, :] = np.outer(
+                np.ones(pre_mask.sum(), dtype=np.float64),
+                sv_pre * sleeve_leverage
+            )
+            exposure_abs[pre_mask] = effective_pre
+            exposure_net[pre_mask] = raw_exposure_net[pre_mask]
+            if effective_pre > phase_cap:
+                scale = phase_cap / effective_pre
+                scale_arr[pre_mask] *= scale
+                sleeve_rets[pre_mask] *= scale
+                factor_contrib[pre_mask] *= scale
+                exposure_abs[pre_mask] *= scale
+                exposure_net[pre_mask] *= scale
+                sleeve_positions[pre_mask, :] *= scale
+                phase_reason[pre_mask] = "Phase cap exceeded"
+
         if _news_signal is not None:
             live_cutoff = pd.Timestamp.now() - pd.Timedelta(days=5)
             for i, d in enumerate(ph_dates):
@@ -1134,11 +1555,52 @@ def _compute_portfolio_returns_vectorized(
                     sv_adj      = _build_sleeve_weight_vector(
                         adj_blend, sleeve_cols,
                         pre_sds=(d < SDS_INCEPTION))
-                    sleeve_rets[i] = sleeve_df.loc[d].values @ sv_adj
+                    adj_sleeve_ret = sleeve_df.reindex([d], fill_value=0.0).values[0] @ sv_adj
+                    adj_exposure_abs = blend["FACTOR"] + np.dot(np.abs(sv_adj), np.abs(sleeve_leverage))
+                    adj_exposure_net = blend["FACTOR"] + np.dot(sv_adj, sleeve_leverage)
+                    adj_scale = 1.0
+                    if adj_exposure_abs > phase_cap:
+                        adj_scale = phase_cap / adj_exposure_abs
+                    sleeve_rets[i] = adj_sleeve_ret * adj_scale
+                    factor_contrib[i] *= adj_scale
+                    exposure_abs[i] = adj_exposure_abs * adj_scale
+                    exposure_net[i] = adj_exposure_net * adj_scale
+                    scale_arr[i] *= adj_scale
+                    sleeve_positions[i, :] = (sv_adj * sleeve_leverage) * adj_scale
+                    phase_reason[i] = "News-adjusted blend"
  
-        portfolio_arr[mask] = blend["FACTOR"] * factor_rets + sleeve_rets
+        return_before_leverage = factor_contrib + sleeve_rets
+        portfolio_arr[mask] = return_before_leverage
+        audit["phase"][mask] = ph
+        audit["factor_return"][mask] = factor_rets
+        audit["sleeve_return"][mask] = sleeve_rets
+        audit["factor_contrib"][mask] = factor_contrib
+        audit["sleeve_contrib"][mask] = sleeve_rets
+        audit["exposure_scale"][mask] = scale_arr
+        audit["raw_gross_exposure"][mask] = raw_exposure_abs
+        audit["raw_net_exposure"][mask] = raw_exposure_net
+        audit["effective_gross_exposure"][mask] = exposure_abs
+        audit["effective_net_exposure"][mask] = exposure_net
+        audit["phase_cap"][mask] = phase_cap
+        audit["phase_cap_exceeded"][mask] = raw_exposure_abs > phase_cap
+        audit["phase_reason"][mask] = phase_reason
+        audit["factor_allocation"][mask] = blend["FACTOR"] * scale_arr
+        audit["alloc_SPY"][mask] = sleeve_positions[:, sleeve_cols.get_loc("SPY")]
+        audit["alloc_TQQQ"][mask] = sleeve_positions[:, sleeve_cols.get_loc("TQQQ")]
+        audit["alloc_GLD"][mask] = sleeve_positions[:, sleeve_cols.get_loc("GLD")]
+        audit["alloc_SH"][mask] = sleeve_positions[:, sleeve_cols.get_loc("SH")]
+        audit["alloc_SDS"][mask] = sleeve_positions[:, sleeve_cols.get_loc("SDS")]
+        audit["alloc_TLT"][mask] = sleeve_positions[:, sleeve_cols.get_loc("TLT")]
+        audit["alloc_BTC_USD"][mask] = sleeve_positions[:, sleeve_cols.get_loc("BTC-USD")]
+        audit["phase_leverage"][mask] = exposure_abs
+        audit["return_before_leverage"][mask] = return_before_leverage
  
     port_series = pd.Series(portfolio_arr, index=dates)
+ 
+    # ── Step 4b: Phase leverage is now exposure-driven.
+    # The model uses the portfolio's actual gross exposure and only
+    # scales back when the phase cap is exceeded.
+    audit["return_after_leverage"] = audit["return_before_leverage"]
  
     # ── Step 5: Derivatives hedge overlay (batch mode) ────────
     # OPTIMIZATION: Previously apply_hedge was called inside the
@@ -1147,48 +1609,74 @@ def _compute_portfolio_returns_vectorized(
     # all dates as arrays — see DerivativesTrading.py.
     if _hedger is not None:
         spy_aligned = spy_series.reindex(dates, fill_value=0.0)
-        base_int    = base_phases.values.astype(int)
-        live_arr    = dates >= (pd.Timestamp.now() - pd.Timedelta(days=5))
+
+        # Precompute QQQ proxy (you didn’t pass QQQ anywhere)
+        qqq_proxy = spy_aligned * 1.2
+
+        hedged_returns = []
+
+        for i, date in enumerate(dates):
+            current_return = float(port_series.iloc[i])
+            spy_ret = float(spy_aligned.iloc[i])
+            qqq_ret = float(qqq_proxy.iloc[i])
+            hedged_ret = _hedger.apply_hedge(
+                portfolio_daily_return = current_return,
+                spy_daily_return       = spy_ret,
+                qqq_daily_return       = qqq_ret,
+                current_regime         = int(base_phases.iloc[i]),
+                date                   = date,
+                live_mode              = (date >= (pd.Timestamp.now() - pd.Timedelta(days=5)))
+            )
+            hedged_returns.append(hedged_ret)
+            audit["spy_return"][i] = spy_ret
+            audit["qqq_return"][i] = qqq_ret
+            audit["hedge_pnl"][i] = hedged_ret - current_return
+            audit["hedge_applied"][i] = abs(audit["hedge_pnl"][i]) > 1e-12
  
-        port_series = _hedger.apply_hedge_batch(
-            portfolio_returns = port_series,
-            spy_returns       = spy_aligned,
-            regimes           = base_int,
-            dates             = dates,
-            live_flags        = live_arr,
-        )
+        port_series = pd.Series(hedged_returns, index=dates)
+        audit["return_after_hedge"] = np.array(hedged_returns, dtype=np.float64)
+    else:
+        audit["return_after_hedge"] = port_series.values
  
-    return port_series
- 
- 
+    portfolio_audit = pd.DataFrame(audit)
+    portfolio_audit.index = dates
+    portfolio_audit["previous_phase"] = portfolio_audit["phase"].shift(1)
+    portfolio_audit["phase_action"] = np.where(
+        portfolio_audit["phase"] != portfolio_audit["previous_phase"],
+        portfolio_audit["previous_phase"].fillna("start").astype(str) + "->" + portfolio_audit["phase"].astype(str),
+        "Hold"
+    )
+    portfolio_audit.loc[portfolio_audit.index[0], "phase_action"] = "Initial allocation"
+    return port_series, portfolio_audit
+
 # ============================================================
-# BACKTEST LOOP — out-of-sample (vectorized)
+# OUT-OF-SAMPLE BACKTEST
 # ============================================================
 test_returns_raw  = returns[returns.index > split_date]
 test_regime_slice = regime[regime.index > split_date]
 test_sleeve       = sleeve_returns[sleeve_returns.index > split_date]
 spy_test          = spy_px[spy_px.index > split_date].pct_change().dropna()
- 
+
 print("\nRunning out-of-sample backtest (vectorized matrix operations)...")
-portfolio_daily = _compute_portfolio_returns_vectorized(
+portfolio_daily, portfolio_audit = _compute_portfolio_returns_vectorized(
     ret_df       = test_returns_raw,
     regime_slice = test_regime_slice,
     sleeve_df    = test_sleeve,
     spy_series   = spy_test,
 )
- 
+
 portfolio_daily = portfolio_daily.reindex(spy_test.index).dropna()
 spy_test        = spy_test.reindex(portfolio_daily.index).dropna()
+portfolio_audit = portfolio_audit.reindex(portfolio_daily.index)
+portfolio_audit["date"] = portfolio_daily.index
 port_cum = (1 + portfolio_daily).cumprod()
 spy_cum  = (1 + spy_test).cumprod()
- 
-# ============================================================
-# BLEND SUMMARY
-# ============================================================
-print("\nPHASE BLEND ALLOCATION SUMMARY")
+_print_portfolio_audit_summary(portfolio_audit, "OUT-OF-SAMPLE")
+_save_portfolio_audit(portfolio_audit, "out_of_sample")
+
 print("=" * 80)
 print(f"{'Phase':<24} {'Factor':>8} {'SPY':>6} {'TQQQ':>6} "
-      f"{'GLD':>6} {'SH':>6} {'SDS':>6} {'TLT':>6}")
+      f"{'GLD':>6} {'SH':>6} {'SDS':>6} {'TLT':>6} {'BTC':>6}")
 print("=" * 80)
 blend_display_map = [
     ("1   (Buildout)",  phase_blend[1]),
@@ -1205,14 +1693,33 @@ for label_str, blend in blend_display_map:
           f"{blend['GLD']*100:>5.0f}% "
           f"{blend['SH']*100:>5.0f}% "
           f"{blend.get('SDS', 0)*100:>5.0f}% "
-          f"{blend.get('TLT', 0)*100:>5.0f}%")
+          f"{blend.get('TLT', 0)*100:>5.0f}%"
+          f"{blend.get('BTC-USD', 0)*100:>5.0f}%")
 print("=" * 80)
- 
+
+print("\nEFFECTIVE EXPOSURE SUMMARY")
+print("=" * 80)
+print(f"{'Phase':<24} {'Factor':>8} {'Gross':>8} {'Net':>8}")
+print("=" * 80)
+for label_str, blend in blend_display_map:
+    factor_exposure = blend['FACTOR']
+    gross_sleeve = sum(abs(blend.get(inst, 0.0)) * abs(SLEEVE_LEVERAGE.get(inst, 1.0))
+                       for inst in SLEEVE_INSTRUMENTS)
+    net_sleeve   = sum(blend.get(inst, 0.0) * SLEEVE_LEVERAGE.get(inst, 1.0)
+                       for inst in SLEEVE_INSTRUMENTS)
+    total_gross  = abs(factor_exposure) + gross_sleeve
+    total_net    = factor_exposure + net_sleeve
+    print(f"  Phase {label_str:<20} "
+          f"{factor_exposure:>8.2f} "
+          f"{total_gross:>8.2f} "
+          f"{total_net:>8.2f}")
+print("=" * 80)
+
 # ============================================================
 # SECTION 10 — SCORECARD (out-of-sample)
 # ============================================================
 print("\n" + "=" * 60)
-print("OUT-OF-SAMPLE PERFORMANCE (last 30% of data)")
+print("OUT-OF-SAMPLE PERFORMANCE (last 50% of data)")
 print("=" * 60)
 print(f"{'Metric':<25} {'Portfolio':>12}  {'SPY B&H':>10}")
 print("=" * 60)
@@ -1258,7 +1765,7 @@ holdout_sleeve  = sleeve_returns[sleeve_returns.index >= holdout_start]
 spy_holdout     = spy_px[spy_px.index >= holdout_start].pct_change().dropna()
  
 print("\nRunning holdout validation (vectorized)...")
-holdout_daily = _compute_portfolio_returns_vectorized(
+holdout_daily, holdout_audit = _compute_portfolio_returns_vectorized(
     ret_df       = holdout_returns,
     regime_slice = holdout_regime,
     sleeve_df    = holdout_sleeve,
@@ -1267,8 +1774,12 @@ holdout_daily = _compute_portfolio_returns_vectorized(
  
 holdout_daily = holdout_daily.reindex(spy_holdout.index).dropna()
 spy_holdout   = spy_holdout.reindex(holdout_daily.index).dropna()
+holdout_audit = holdout_audit.reindex(holdout_daily.index)
+holdout_audit["date"] = holdout_daily.index
 holdout_cum   = (1 + holdout_daily).cumprod()
 spy_h_cum     = (1 + spy_holdout).cumprod()
+_print_portfolio_audit_summary(holdout_audit, "HOLDOUT")
+_save_portfolio_audit(holdout_audit, "holdout")
  
 print("\n" + "=" * 60)
 print("HOLDOUT VALIDATION (2024 — present, never tuned on)")
@@ -1309,53 +1820,105 @@ for year, row in holdout_annual.iterrows():
 print("=" * 40)
  
 # ============================================================
-# SECTION 11 — TOP HOLDINGS BY PHASE
+# SECTION 11 — ALL HOLDINGS BY PHASE
 # ============================================================
- 
-def print_holdings(phase_key, stock_weights, ticker_list, top_n=30):
+
+def print_holdings(phase_key, stock_weights, ticker_list, min_weight_threshold=0.001):
+    """
+    Print all positions held in the portfolio for a given phase.
+    
+    Parameters
+    ----------
+    phase_key : int or str — phase identifier (1, 1b, 2, 3, 4)
+    stock_weights : np.ndarray — weight for each stock
+    ticker_list : np.ndarray — ticker symbols
+    min_weight_threshold : float — only show positions above this threshold (default 0.1%)
+    """
     label_str = "Momentum Accel" if phase_key == "1b" else labels[phase_key]
-    top_idx     = np.argsort(stock_weights)[::-1][:top_n]
-    top_tickers = ticker_list[top_idx]
-    top_weights = stock_weights[top_idx]
-    print(f"\nTOP {top_n} HOLDINGS — Phase {phase_key} ({label_str}) Portfolio")
-    print("=" * 35)
+    
+    # Sort all positions by weight (descending)
+    sorted_idx = np.argsort(stock_weights)[::-1]
+    
+    # Filter for positions above minimum threshold
+    significant_idx = sorted_idx[stock_weights[sorted_idx] >= min_weight_threshold]
+    
+    top_tickers = ticker_list[significant_idx]
+    top_weights = stock_weights[significant_idx]
+    num_positions = len(top_tickers)
+    
+    print(f"\n{'='*60}")
+    print(f"ALL HOLDINGS — Phase {phase_key} ({label_str}) Portfolio")
+    print(f"Total Positions: {num_positions} (weight ≥ {min_weight_threshold*100:.3f}%)")
+    print(f"{'='*60}")
+    print(f"{'Ticker':<10} {'Weight':>12} {'Cumulative %':>15}")
+    print(f"{'-'*60}")
+    
+    cumulative = 0.0
     for ticker, weight in zip(top_tickers, top_weights):
-        print(f"  {ticker:<8} {weight*100:>6.2f}%")
-    print("=" * 35)
- 
+        cumulative += weight
+        print(f"{ticker:<10} {weight*100:>11.3f}% {cumulative*100:>14.2f}%")
+    
+    print(f"{'-'*60}")
+    print(f"{'TOTAL':<10} {cumulative*100:>11.2f}%")
+    print(f"{'='*60}")
+
 phase_weights_display = {
     1: stock_w_growth, "1b": stock_w_momentum,
     2: stock_w_momentum, 3: stock_w_defensive, 4: stock_w_recovery,
 }
- 
+
 for phase_key in [1, "1b", 2, 3, 4]:
     print_holdings(phase_key, phase_weights_display[phase_key],
-                   returns.columns.values, top_n=30)
- 
+                   returns.columns.values, min_weight_threshold=0.001)
+
 current_phase = int(regime.iloc[-1])
 eff_now       = resolve_phase(returns.index[-1], current_phase)
 eff_label     = "Momentum Accel" if eff_now == "1b" else labels[current_phase]
 print(f"\n>>> CURRENTLY ACTIVE: Phase {eff_now} ({eff_label}) <<<")
- 
+
 if _hedger is not None:
     today = pd.Timestamp.today().normalize()
-    _hedger.apply_hedge(0.0, 0.0, current_regime, date=today, live_mode=True)
- 
+    _hedger.apply_hedge(0.0, 0.0, current_phase, date=today, live_mode=True)
 # ============================================================
 # SECTION 12 — CHARTS
 # ============================================================
 fig, axes = plt.subplots(2, 2, figsize=(16, 10))
 fig.suptitle("Spatial-Temporal Portfolio Model — v4 (Parallelized)", fontsize=14)
  
-axes[0, 0].plot(port_cum.index, port_cum.values,
-                label="Portfolio", color="magenta", linewidth=1.5)
+regime_colors = {1: "green", 2: "yellow", 3: "red", 4: "orange"}
+
+# Create a single portfolio line with colors that change based on regime
+# Align portfolio cumulative returns and regime to same index
+port_cum_aligned = port_cum.reindex(regime.index).dropna()
+regime_aligned = regime.reindex(port_cum_aligned.index)
+
+if len(port_cum_aligned) > 1:
+    # Convert datetime index to matplotlib's date format
+    x_dates = date2num(port_cum_aligned.index)
+    y_values = port_cum_aligned.values
+    
+    # Create line segments for LineCollection
+    points = np.array([x_dates, y_values]).T.reshape(-1, 1, 2)
+    segments = np.concatenate([points[:-1], points[1:]], axis=1)
+    
+    # Assign colors to each segment based on regime
+    colors = [regime_colors[int(regime_aligned.iloc[i])] for i in range(len(segments))]
+    
+    # Create and add LineCollection
+    lc = LineCollection(segments, colors=colors, linewidths=1.5)
+    axes[0, 0].add_collection(lc)
+    axes[0, 0].autoscale()
+
 axes[0, 0].plot(spy_cum.index,  spy_cum.values,
                 label="SPY B&H",  color="cyan",    linewidth=1.5)
 axes[0, 0].set_title("Cumulative Returns (Out of Sample)")
 axes[0, 0].set_ylabel("Growth of $1")
-axes[0, 0].legend()
- 
-regime_colors = {1: "green", 2: "yellow", 3: "red", 4: "orange"}
+
+# Add custom legend entry for portfolio line
+legend_elements = [Line2D([0], [0], color="white", linewidth=1.5, label="Portfolio (colored by regime)"),
+                   Line2D([0], [0], color="cyan", linewidth=1.5, label="SPY B&H")]
+axes[0, 0].legend(handles=legend_elements, loc="upper left")
+
 for phase in [1, 2, 3, 4]:
     mask = regime == phase
     axes[0, 1].scatter(
