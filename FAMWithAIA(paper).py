@@ -54,6 +54,7 @@ limitations under the License.
  
 import os
 import sys
+import re
 import warnings
  
 import numpy as np
@@ -69,6 +70,13 @@ from sklearn.preprocessing import StandardScaler
 import urllib.request
 from io import StringIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import argparse
+import json
+import pickle
+import threading
+from dataclasses import dataclass, field
+from typing import Optional
+from collections import deque
 
 #live trading with IBKR API
 from ib_insync import *
@@ -254,7 +262,7 @@ except Exception as _hedge_err:
 #  - Bates jump-diffusion: Heston stochastic volatility + Poisson
 #    jump process for per-regime scenario generation.
 #  - Phase-specific blends: tactical allocations blending factor
-#    exposure with ETF sleeves (TQQQ, GLD, SDS, TLT, SH).
+#    exposure with ETF sleeves (QQQ, GLD, SDS, TLT, SH).
 #  - Walk-forward validation: strict train/test split prevents
 #    any look-ahead in factor construction or optimization.
  
@@ -270,14 +278,14 @@ CVAR_ALPHA  = 0.10
 TRAIN_FRAC  = 0.5
 REGIME_CONFIRM_DAYS = 5
 PHASE1B_MOM_THRESH  = 0.03
-SLEEVE_INSTRUMENTS  = ["SPY", "TQQQ", "GLD", "SH", "SDS", "TLT", "BTC-USD"]
+SLEEVE_INSTRUMENTS  = ["SPY", "QQQ", "GLD", "SH", "SDS", "TLT", "BTC-USD"]
 SDS_INCEPTION       = pd.Timestamp("2006-07-11")
 
 # Actual fund leverage multipliers used for exposure control.
 # This is separate from capital allocation weights.
 SLEEVE_LEVERAGE     = {
     "SPY":    1.0,
-    "TQQQ":   3.0,
+    "QQQ":    1.0,
     "GLD":    1.0,
     "SH":    -1.0,
     "SDS":   -2.0,
@@ -529,7 +537,7 @@ if isinstance(sleeve_raw.columns, pd.MultiIndex):
  
 sleeve_raw = sleeve_raw.ffill()
 # ── Why fillna(0.0) instead of dropna() ────────────────────────────────────
-# TQQQ (launched 2010) and SDS (launched 2006) have NaN returns for every
+# SDS (launched 2006) have NaN returns for every
 # date before their IPO.  dropna() on a multi-column DataFrame removes ANY
 # row where even one column is NaN, so all pre-2010 dates get silently
 # stripped.  The vectorized backtest then raises KeyError when it looks up
@@ -1188,19 +1196,19 @@ def validate_blend(blend: dict) -> dict:
     return blend
 
 phase_blend = {
-    1: {"FACTOR": 0.75, "SPY": 0.00, "TQQQ": 0.10, "GLD": 0.00,
+    1: {"FACTOR": 0.75, "SPY": 0.00, "QQQ": 0.10, "GLD": 0.00,
         "SH": 0.00, "SDS": 0.05, "TLT": 0.00, "BTC-USD": 0.10},
  
-    "1b": {"FACTOR": 0.75, "SPY": 0.00, "TQQQ": 0.10, "GLD": 0.00,
+    "1b": {"FACTOR": 0.75, "SPY": 0.00, "QQQ": 0.10, "GLD": 0.00,
            "SH": 0.00, "SDS": 0.05, "TLT": 0.00, "BTC-USD": 0.10},
  
-    2: {"FACTOR": 0.75, "SPY": 0.00, "TQQQ": 0.10, "GLD": 0.00,
+    2: {"FACTOR": 0.75, "SPY": 0.00, "QQQ": 0.10, "GLD": 0.00,
         "SH": 0.00, "SDS": 0.00, "TLT": 0.00, "BTC-USD": 0.15},
  
-    3: {"FACTOR": 0.20, "SPY": 0.00, "TQQQ": 0.00, "GLD": 0.20,
+    3: {"FACTOR": 0.20, "SPY": 0.00, "QQQ": 0.00, "GLD": 0.20,
         "SH": 0.10, "SDS": 0.35, "TLT": 0.15, "BTC-USD": 0.00},
  
-    4: {"FACTOR": 0.75, "SPY": 0.00, "TQQQ": 0.05, "GLD": 0.15,
+    4: {"FACTOR": 0.75, "SPY": 0.00, "QQQ": 0.05, "GLD": 0.15,
         "SH": 0.00, "SDS": 0.00, "TLT": 0.00, "BTC-USD": 0.05},
 }
 phase_blend = {k: validate_blend(v) for k, v in phase_blend.items()}
@@ -1280,7 +1288,7 @@ def _save_portfolio_audit(audit_df: pd.DataFrame, label: str) -> None:
                 "phase_cap", "phase_cap_exceeded", "raw_gross_exposure",
                 "raw_net_exposure", "effective_gross_exposure",
                 "effective_net_exposure", "factor_allocation",
-                "alloc_SPY", "alloc_TQQQ", "alloc_GLD", "alloc_SH",
+                "alloc_SPY", "alloc_QQQ", "alloc_GLD", "alloc_SH",
                 "alloc_SDS", "alloc_TLT", "alloc_BTC_USD",
                 "hedge_pnl", "hedge_applied"
             ]
@@ -1394,7 +1402,7 @@ def _compute_portfolio_returns_vectorized(
         "phase_action": np.full(n, "", dtype=object),
         "factor_allocation": np.zeros(n, dtype=np.float64),
         "alloc_SPY": np.zeros(n, dtype=np.float64),
-        "alloc_TQQQ": np.zeros(n, dtype=np.float64),
+        "alloc_QQQ": np.zeros(n, dtype=np.float64),
         "alloc_GLD": np.zeros(n, dtype=np.float64),
         "alloc_SH": np.zeros(n, dtype=np.float64),
         "alloc_SDS": np.zeros(n, dtype=np.float64),
@@ -1493,7 +1501,7 @@ def _compute_portfolio_returns_vectorized(
 
         # ── reindex instead of .loc[] ────────────────────────────
         # .loc[] raises KeyError for dates absent from sleeve_df
-        # (e.g. pre-TQQQ era, calendar mismatches between the main
+        # (calendar mismatches between the main
         # returns index and the ETF trading calendar).
         # .reindex(..., fill_value=0.0) silently returns 0 for any
         # missing date — instrument not trading = 0% return.
@@ -1592,7 +1600,7 @@ def _compute_portfolio_returns_vectorized(
         audit["phase_reason"][mask] = phase_reason
         audit["factor_allocation"][mask] = blend["FACTOR"] * scale_arr
         audit["alloc_SPY"][mask] = sleeve_positions[:, sleeve_cols.get_loc("SPY")]
-        audit["alloc_TQQQ"][mask] = sleeve_positions[:, sleeve_cols.get_loc("TQQQ")]
+        audit["alloc_QQQ"][mask] = sleeve_positions[:, sleeve_cols.get_loc("QQQ")]
         audit["alloc_GLD"][mask] = sleeve_positions[:, sleeve_cols.get_loc("GLD")]
         audit["alloc_SH"][mask] = sleeve_positions[:, sleeve_cols.get_loc("SH")]
         audit["alloc_SDS"][mask] = sleeve_positions[:, sleeve_cols.get_loc("SDS")]
@@ -1681,7 +1689,7 @@ _print_portfolio_audit_summary(portfolio_audit, "OUT-OF-SAMPLE")
 _save_portfolio_audit(portfolio_audit, "out_of_sample")
 
 print("=" * 80)
-print(f"{'Phase':<24} {'Factor':>8} {'SPY':>6} {'TQQQ':>6} "
+print(f"{'Phase':<24} {'Factor':>8} {'SPY':>6} {'QQQ':>6} "
       f"{'GLD':>6} {'SH':>6} {'SDS':>6} {'TLT':>6} {'BTC':>6}")
 print("=" * 80)
 blend_display_map = [
@@ -1695,7 +1703,7 @@ for label_str, blend in blend_display_map:
     print(f"  Phase {label_str:<20} "
           f"{blend['FACTOR']*100:>7.0f}% "
           f"{blend['SPY']*100:>5.0f}% "
-          f"{blend['TQQQ']*100:>5.0f}% "
+          f"{blend['QQQ']*100:>5.0f}% "
           f"{blend['GLD']*100:>5.0f}% "
           f"{blend['SH']*100:>5.0f}% "
           f"{blend.get('SDS', 0)*100:>5.0f}% "
@@ -1969,15 +1977,20 @@ else:
 # ============================================================
 # LIVE / PAPER-TRADING HELPERS (IBKR TWS via ib_insync)
 # ============================================================
-import argparse as _argparse
 
 def _ib_connect(host: str = "127.0.0.1", port: int = 7497, client_id: int = 101,
-                timeout: int = 10, max_attempts: int = 5) -> IB:
+                live_data: bool = False, timeout: int = 10, max_attempts: int = 5) -> IB:
     ib = IB()
+    market_data_type = 1 if live_data else 3
     for attempt in range(1, max_attempts + 1):
         try:
             ib.connect(host, port, clientId=client_id, timeout=timeout)
-            print(f"[IB] Connected to {host}:{port} (clientId={client_id})")
+            # Request delayed market data type when possible (3 = delayed-frozen).
+            try:
+                ib.reqMarketDataType(market_data_type)
+            except Exception as _md_err:
+                print(f"[IB] reqMarketDataType warning: {_md_err}")
+            print(f"[IB] Connected to {host}:{port} (clientId={client_id}) using market data type {market_data_type}")
             return ib
         except Exception as e:
             print(f"[IB] Connect attempt {attempt}/{max_attempts} failed: {e}")
@@ -2020,44 +2033,211 @@ def _positions_dict(ib: IB) -> dict:
     return out
 
 
-def _get_market_prices(ib: IB, symbols: list[str]) -> dict:
-    prices = {}
-    contracts = []
-    for s in symbols:
+def _parse_int_env(key: str, default: int) -> int:
+    raw = os.environ.get(key, "")
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        m = re.search(r"\d+", raw)
+        if m:
+            print(f"[Live] Parsed numeric {key}={m.group(0)} from '{raw}'")
+            return int(m.group(0))
+        print(f"[Live] Env var {key}='{raw}' invalid, falling back to {default}")
+        return default
+
+
+def _eastern_now() -> datetime.datetime:
+    return datetime.datetime.utcnow() - datetime.timedelta(hours=4)
+
+
+def _build_exit_checker() -> callable:
+    try:
+        import msvcrt
+
+        def _check():
+            try:
+                if msvcrt.kbhit():
+                    return msvcrt.getwch().lower() == "q"
+            except Exception:
+                return False
+            return False
+
+        return _check
+    except Exception:
         try:
-            contracts.append(Stock(s, "SMART", "USD"))
+            import sys
+            import select
+
+            def _check():
+                try:
+                    dr, _, _ = select.select([sys.stdin], [], [], 0)
+                    if dr:
+                        return sys.stdin.read(1).lower() == "q"
+                except Exception:
+                    return False
+                return False
+
+            return _check
         except Exception:
-            contracts.append(Stock(s, "SMART", "USD"))
+            return lambda: os.path.exists("STOP_LIVE")
+
+
+def _build_tradable_blend(blend: dict) -> dict:
+    tradable_allowed = {"SPY", "QQQ", "QQQ", "GLD", "TLT", "SH", "SDS", "IWM", "DIA"}
+    weights = {}
+    for symbol, value in blend.items():
+        if symbol == "FACTOR":
+            weights["SPY"] = weights.get("SPY", 0.0) + float(value)
+        elif symbol in tradable_allowed:
+            weights[symbol] = weights.get(symbol, 0.0) + float(value)
+        else:
+            print(f"[Live] Skipping non-tradable sleeve: {symbol}")
+    total = sum(weights.values())
+    if total <= 0:
+        return {}
+    return {k: float(v) / total for k, v in weights.items()}
+
+
+def _rebalance_portfolio(ib: IB, blend: dict, total_value: float,
+                         tolerance: float = 0.001) -> None:
+    target = _build_tradable_blend(blend)
+    if not target:
+        print("[Live] No tradable allocation after blend normalization.")
+        return
+
+    prices = _get_market_prices(ib, list(target.keys()))
+    positions = _positions_dict(ib)
+
+    orders = []
+    for symbol, weight in target.items():
+        price = prices.get(symbol)
+        if price is None:
+            print(f"[Live] No valid price for {symbol}, skipping.")
+            continue
+
+        target_value = float(total_value) * float(weight)
+        desired_qty = int(round(target_value / price))
+        current_qty = int(round(float(positions.get(symbol, 0))))
+        delta = desired_qty - current_qty
+        if abs(delta) * price < max(50.0, total_value * tolerance):
+            print(f"[Live] {symbol}: delta {delta} shares below tolerance, skipping.")
+            continue
+        orders.append((symbol, delta, price))
+
+    if not orders:
+        print("[Live] No orders to place after tolerance check.")
+        return
+
+    for symbol, delta, price in orders:
+        _place_market_order(ib, symbol, delta)
+
+
+def _schedule_next_rebalances(today: datetime.date) -> set:
+    return {(9, 35), (11, 30), (13, 30), (15, 45)}
+
+
+def _get_market_prices(ib: IB, symbols: list[str]) -> dict:
+    prices = {s: None for s in symbols}
+    contracts = [Stock(s, "SMART", "USD") for s in symbols]
+
     try:
         tickers = ib.reqTickers(*contracts)
     except Exception as e:
         print(f"[IB] reqTickers failed: {e} — falling back to yfinance for prices")
         tickers = []
 
+    # Map symbol -> ticker for quick lookup
+    ticker_map = {}
     for t in tickers:
-        sym = getattr(t.contract, "symbol", None)
-        price = None
         try:
-            if getattr(t, "last", None) is not None and t.last > 0:
-                price = float(t.last)
+            sym = getattr(t.contract, "symbol", None)
+            if sym:
+                ticker_map[sym] = t
         except Exception:
-            price = None
-        if price is None:
+            continue
+
+    for s in symbols:
+        price = None
+        t = ticker_map.get(s)
+        if t is not None:
+            # Prefer live last trade if available
             try:
-                if getattr(t, "bid", None) and getattr(t, "ask", None):
-                    price = float((t.bid + t.ask) / 2.0)
+                if getattr(t, "last", None) is not None and float(t.last) > 0:
+                    price = float(t.last)
             except Exception:
                 price = None
-        prices[sym] = price
 
-    # fill missing with yfinance last close
-    for s in symbols:
-        if prices.get(s) is None:
+            # If no live last, prefer IB delayed fields (delayedLast / delayedBid/delayedAsk / delayedClose)
+            if price is None:
+                try:
+                    dlast = getattr(t, "delayedLast", None)
+                    if dlast is not None and float(dlast) > 0:
+                        price = float(dlast)
+                        print(f"[IB] Using delayedLast for {s}: {price}")
+                except Exception:
+                    price = None
+
+            if price is None:
+                try:
+                    dbid = getattr(t, "delayedBid", None)
+                    dask = getattr(t, "delayedAsk", None)
+                    if dbid is not None and dask is not None and float(dbid) > 0 and float(dask) > 0:
+                        price = float((float(dbid) + float(dask)) / 2.0)
+                        print(f"[IB] Using delayed Bid/Ask midpoint for {s}: {price}")
+                except Exception:
+                    price = None
+
+            # fallback to delayed close if present
+            if price is None:
+                try:
+                    dclose = getattr(t, "delayedClose", None)
+                    if dclose is not None and float(dclose) > 0:
+                        price = float(dclose)
+                        print(f"[IB] Using delayedClose for {s}: {price}")
+                except Exception:
+                    price = None
+
+            # If no delayed fields, try live Bid/Ask midpoint
+            if price is None:
+                try:
+                    bid = getattr(t, "bid", None)
+                    ask = getattr(t, "ask", None)
+                    if bid is not None and ask is not None and float(bid) > 0 and float(ask) > 0:
+                        price = float((float(bid) + float(ask)) / 2.0)
+                except Exception:
+                    price = None
+
+            # Last resort: ticker.close or contract close
+            if price is None:
+                try:
+                    close = getattr(t, "close", None)
+                    if close is not None and float(close) > 0:
+                        price = float(close)
+                except Exception:
+                    price = None
+
+        # Fallback: use yfinance last close when IB data is missing or invalid
+        if price is None or not np.isfinite(price) or price <= 0:
             try:
-                p = yf.download(s, period="2d", interval="1d", progress=False)["Close"].iloc[-1]
-                prices[s] = float(p)
+                df = yf.download(s, period="5d", interval="1d", progress=False)
+                if isinstance(df, pd.DataFrame) and "Close" in df.columns:
+                    last_close = df["Close"].dropna().iloc[-1]
+                    price = float(last_close)
             except Exception:
-                prices[s] = None
+                price = None
+
+        if price is None or not np.isfinite(price) or price <= 0:
+            prices[s] = None
+        else:
+            prices[s] = float(price)
+
+    # If all IB prices are missing, warn the user that market-data subscription
+    # may be required; this is informative only — fallback to yfinance is used.
+    if tickers and all(prices[s] is None for s in symbols):
+        print("[IB] Market data appears delayed or unavailable for requested symbols; using yfinance fallback prices.")
+
     return prices
 
 
@@ -2077,7 +2257,7 @@ def _place_market_order(ib: IB, symbol: str, qty: int) -> None:
 def _rebalance_sleeves_to_blend(ib: IB, blend: dict, total_value: float, tolerance: float = 0.0005) -> None:
     # We map "FACTOR" to SPY as a tradable proxy for the factor sleeve.
     # Only attempt to trade common ETFs; skip crypto or exotic tickers.
-    tradable_allowed = {"SPY", "TQQQ", "GLD", "SH", "SDS", "TLT", "QQQ", "IWM", "DIA"}
+    tradable_allowed = {"SPY", "QQQ", "GLD", "SH", "SDS", "TLT", "QQQ", "IWM", "DIA"}
     target = {}
     for k, v in blend.items():
         if k == "FACTOR":
@@ -2098,14 +2278,31 @@ def _rebalance_sleeves_to_blend(ib: IB, blend: dict, total_value: float, toleran
 
     orders = []
     for sym in symbols:
-        price = prices.get(sym)
-        if price is None or price <= 0:
-            print(f"[Live] No price available for {sym}, skipping")
+        raw_price = prices.get(sym)
+        try:
+            price = float(raw_price) if raw_price is not None else None
+        except Exception:
+            price = None
+
+        if price is None or not np.isfinite(price) or price <= 0:
+            print(f"[Live] No valid price available for {sym} (raw={raw_price}), skipping")
             continue
-        weight = target.get(sym, 0.0)
-        desired_value = total_value * weight
-        desired_shares = int(round(desired_value / price))
-        current_shares = int(round(pos.get(sym, 0)))
+
+        weight = float(target.get(sym, 0.0))
+        desired_value = float(total_value) * weight
+
+        # Avoid ZeroDivisionError / NaN rounding errors by guarding the division
+        try:
+            desired_shares = int(round(desired_value / price))
+        except Exception:
+            print(f"[Live] Failed to compute desired shares for {sym} (price={price}), skipping")
+            continue
+
+        try:
+            current_shares = int(round(float(pos.get(sym, 0))))
+        except Exception:
+            current_shares = int(pos.get(sym, 0) or 0)
+
         delta = desired_shares - current_shares
         if abs(delta) * price / (total_value + 1e-12) < tolerance:
             print(f"[Live] {sym}: delta below tolerance — no trade (delta_shares={delta})")
@@ -2120,12 +2317,33 @@ def _rebalance_sleeves_to_blend(ib: IB, blend: dict, total_value: float, toleran
         _place_market_order(ib, sym, delta)
 
 
-def run_live_paper_trading(rebalance_interval: int = 3600) -> None:
+def run_live_paper_trading(rebalance_interval: int = 60, live_data: bool = False,
+                           tolerance: float = 0.001) -> None:
     host = os.environ.get("IB_HOST", "127.0.0.1")
-    port = int(os.environ.get("IB_PORT", "7497"))
-    client_id = int(os.environ.get("IB_CLIENT_ID", "101"))
+    # parse port with safe fallback
+    try:
+        port = int(os.environ.get("IB_PORT", "7497"))
+    except Exception:
+        print(f"[Live] IB_PORT env var '{os.environ.get('IB_PORT')}' invalid — using 7497")
+        port = 7497
+    # parse client id robustly; fall back to default 101 if not numeric
+    client_id_env = os.environ.get("IB_CLIENT_ID", "DUQ210493")
+    if client_id_env is None or client_id_env == "":
+        client_id = 101
+    else:
+        try:
+            client_id = int(client_id_env)
+        except Exception:
+            import re
+            m = re.search(r"\d+", client_id_env)
+            if m:
+                client_id = int(m.group(0))
+                print(f"[Live] Parsed numeric client id {client_id} from IB_CLIENT_ID '{client_id_env}'")
+            else:
+                client_id = 101
+                print(f"[Live] IB_CLIENT_ID '{client_id_env}' not numeric — falling back to default client id {client_id}")
 
-    ib = _ib_connect(host=host, port=port, client_id=client_id)
+    ib = _ib_connect(host=host, port=port, client_id=client_id, live_data=live_data)
 
     try:
         net_liq = _get_account_net_liq_usd(ib) or 100000.0
@@ -2141,32 +2359,44 @@ def run_live_paper_trading(rebalance_interval: int = 3600) -> None:
         current_blend = phase_blend[ph_key_live]
         print(f"[Live] Current phase: {eff_now_live} — applying blend: {current_blend}")
 
-        _rebalance_sleeves_to_blend(ib, current_blend, float(net_liq))
+        _rebalance_portfolio(ib, current_blend, float(net_liq), tolerance=tolerance)
 
         last_rebalance_date = pd.Timestamp.now().normalize()
 
-        print("[Live] Entering headless loop — press Ctrl+C to exit.")
-        while True:
-            time.sleep(rebalance_interval)
-            now_date = pd.Timestamp.now().normalize()
-            if now_date > last_rebalance_date:
-                try:
-                    net_liq = _get_account_net_liq_usd(ib) or net_liq
-                    try:
-                        current_phase_live = int(regime.iloc[-1])
-                    except Exception:
-                        current_phase_live = int(current_regime)
-                    eff_now_live = resolve_phase(returns.index[-1], current_phase_live)
-                    ph_key_live = eff_now_live if eff_now_live == "1b" else int(eff_now_live)
-                    current_blend = phase_blend[ph_key_live]
-                    print(f"[Live] Daily rebalance — date {now_date.date()} phase {eff_now_live}")
-                    _rebalance_sleeves_to_blend(ib, current_blend, float(net_liq))
-                    last_rebalance_date = now_date
-                except Exception as e:
-                    print(f"[Live] Rebalance iteration failed: {e}")
+        print("[Live] Entering headless loop — press 'q' to exit (Ctrl+C will be ignored).")
+        exit_pressed = _build_exit_checker()
 
-    except KeyboardInterrupt:
-        print("[Live] Interrupted by user — shutting down live loop.")
+        try:
+            while True:
+                # Sleep in 1s increments so exit key is responsive
+                for _ in range(max(1, int(rebalance_interval))):
+                    time.sleep(1)
+                    if exit_pressed():
+                        print("[Live] Exit key detected — shutting down live loop.")
+                        raise SystemExit
+
+                now_date = pd.Timestamp.now().normalize()
+                if now_date > last_rebalance_date:
+                    try:
+                        net_liq = _get_account_net_liq_usd(ib) or net_liq
+                        try:
+                            current_phase_live = int(regime.iloc[-1])
+                        except Exception:
+                            current_phase_live = int(current_regime)
+                        eff_now_live = resolve_phase(returns.index[-1], current_phase_live)
+                        ph_key_live = eff_now_live if eff_now_live == "1b" else int(eff_now_live)
+                        current_blend = phase_blend[ph_key_live]
+                        print(f"[Live] Daily rebalance — date {now_date.date()} phase {eff_now_live}")
+                        _rebalance_portfolio(ib, current_blend, float(net_liq), tolerance=tolerance)
+                        last_rebalance_date = now_date
+                    except Exception as e:
+                        print(f"[Live] Rebalance iteration failed: {e}")
+        except SystemExit:
+            print("[Live] Live loop exited by user request.")
+        except KeyboardInterrupt:
+            print("[Live] Ctrl+C detected — ignored. Use 'Ctrl + Q' to exit the live loop.")
+        except Exception as e:
+            print(f"[Live] Live loop terminated due to error: {e}")
     finally:
         try:
             ib.disconnect()
@@ -2174,12 +2404,998 @@ def run_live_paper_trading(rebalance_interval: int = 3600) -> None:
             pass
 
 
+# ============================================================
+# FUND MANAGER CLASSES MERGED FROM FundManager.py
+# ============================================================
+
+try:
+    import anthropic
+    ANTHROPIC_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_AVAILABLE = False
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("FundManager")
+
+IB_HOST = os.environ.get("IB_HOST", "127.0.0.1")
+IB_PORT = int(os.environ.get("IB_PORT", "7497"))
+IB_CLIENT_ID = _parse_int_env("IB_CLIENT_ID", 101)
+IB_MARKET_DATA_TYPE = int(os.environ.get("IB_MKT_DATA_TYPE", "3"))
+
+TRADABLE_UNIVERSE = {
+    "FACTOR": "SPY",
+    "SPY": "SPY",
+    "QQQ": "QQQ",
+    "GLD": "GLD",
+    "TLT": "TLT",
+    "SH": "SH",
+    "SDS": "SDS",
+    "TQQQ": "TQQQ",
+    "IWM": "IWM",
+    "DIA": "DIA",
+    "BTC-USD": None,
+}
+
+DAILY_REBALANCE_TIMES = [
+    (9, 35),
+    (11, 30),
+    (13, 30),
+    (15, 45),
+]
+
+SIGNAL_CHECK_INTERVAL_SEC = 300
+VWAP_MOMENTUM_THRESHOLD = 0.003
+VWAP_MOMENTUM_THRESHOLD_STRONG = 0.008
+MEAN_REVERSION_ZSCORE = 2.0
+SIGNAL_CONFIDENCE_GATE = 0.55
+SIGNAL_MAX_TRADE_PCT = 0.03
+
+AI_AGENT_INTERVAL_SEC = 1800
+AI_MODEL = "claude-sonnet-4-5-20251101"
+AI_MAX_TOKENS = 800
+AI_APPROVAL_REQUIRED = False
+
+RISK_CHECK_INTERVAL_SEC = 60
+MAX_DAILY_LOSS_PCT = 0.03
+MAX_SINGLE_POSITION_PCT = 0.50
+MIN_ORDER_VALUE = 50.0
+ORDER_TOLERANCE_PCT = 0.001
+LIMIT_ORDER_OFFSET_PCT = 0.0005
+
+
+@dataclass
+class MarketSnapshot:
+    symbol: str
+    last_price: float
+    vwap: float
+    open_price: float
+    high_price: float
+    low_price: float
+    return_today: float
+    return_1h: float
+    rsi_14: float
+    zscore_30m: float
+    volume_ratio: float
+    timestamp: datetime.datetime = field(default_factory=datetime.datetime.now)
+
+
+@dataclass
+class StrategySignal:
+    symbol: str
+    direction: int
+    confidence: float
+    source: str
+    size_pct: float
+    reasoning: str = ""
+
+
+@dataclass
+class TradeRecord:
+    timestamp: str
+    symbol: str
+    side: str
+    qty: int
+    price: float
+    value: float
+    source: str
+    reasoning: str
+
+
+@dataclass
+class FundState:
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    net_liq: float = 100_000.0
+    positions: dict = field(default_factory=dict)
+    daily_pnl_pct: float = 0.0
+    current_regime: int = 1
+    current_phase: str = "1"
+    current_blend: dict = field(default_factory=dict)
+    regime_changed: bool = False
+    latest_signals: list = field(default_factory=list)
+    ai_conviction: float = 0.0
+    ai_reasoning: str = ""
+    circuit_breaker: bool = False
+    trading_halted: bool = False
+    rebalances_today: int = 0
+    trades_today: int = 0
+    session_date: datetime.date = field(default_factory=lambda: datetime.date.today())
+    trade_log: list = field(default_factory=list)
+
+
+class IBManager:
+    def __init__(self, state: FundState):
+        self.state = state
+        self.ib = IB()
+        self._lock = threading.Lock()
+
+    def connect(self, max_attempts: int = 5) -> bool:
+        for attempt in range(1, max_attempts + 1):
+            try:
+                self.ib.connect(IB_HOST, IB_PORT, clientId=IB_CLIENT_ID, timeout=15)
+                self.ib.reqMarketDataType(IB_MARKET_DATA_TYPE)
+                log.info(f"[IB] Connected to {IB_HOST}:{IB_PORT} (clientId={IB_CLIENT_ID})")
+                log.info(f"[IB] Market data type set to {IB_MARKET_DATA_TYPE} ({'live' if IB_MARKET_DATA_TYPE == 1 else 'delayed (free)'})")
+                return True
+            except Exception as e:
+                log.warning(f"[IB] Connect attempt {attempt}/{max_attempts}: {e}")
+                time.sleep(5)
+        log.error("[IB] Failed to connect after all attempts.")
+        return False
+
+    def ensure_connected(self) -> bool:
+        if self.ib and self.ib.isConnected():
+            return True
+        log.warning("[IB] Connection lost — attempting reconnect.")
+        return self.connect(max_attempts=3)
+
+    def get_account_nlv(self) -> float:
+        if not self.ensure_connected():
+            return self.state.net_liq
+        for av in (self.ib.accountValues() or []):
+            if getattr(av, "tag", "") == "NetLiquidation" and getattr(av, "currency", "") == "USD":
+                try:
+                    return float(av.value)
+                except Exception:
+                    pass
+        for s in (self.ib.accountSummary() or []):
+            if getattr(s, "tag", "") == "NetLiquidation" and getattr(s, "currency", "") == "USD":
+                try:
+                    return float(s.value)
+                except Exception:
+                    pass
+        return self.state.net_liq
+
+    def get_positions(self) -> dict:
+        pos = {}
+        try:
+            for p in (self.ib.positions() or []):
+                sym = getattr(p.contract, "symbol", None)
+                if sym:
+                    pos[sym] = pos.get(sym, 0) + int(p.position)
+        except Exception as e:
+            log.warning(f"[IB] get_positions failed: {e}")
+        return pos
+
+    def get_prices(self, symbols: list) -> dict:
+        if not self.ensure_connected():
+            return self._prices_from_yfinance(symbols)
+        prices = {s: None for s in symbols}
+        contracts = [Stock(s, "SMART", "USD") for s in symbols if TRADABLE_UNIVERSE.get(s, s) is not None]
+        try:
+            tickers = self.ib.reqTickers(*contracts)
+        except Exception as e:
+            log.warning(f"[IB] reqTickers failed: {e} — using yfinance")
+            return self._prices_from_yfinance(symbols)
+        ticker_map = {}
+        for t in tickers:
+            sym = getattr(t.contract, "symbol", None)
+            if sym:
+                ticker_map[sym] = t
+        for s in symbols:
+            t = ticker_map.get(s)
+            if t is None:
+                continue
+            for attr in ("last", "delayedLast", "close", "delayedClose"):
+                try:
+                    v = getattr(t, attr, None)
+                    if v is not None and float(v) > 0:
+                        prices[s] = float(v)
+                        break
+                except Exception:
+                    continue
+            if prices[s] is None:
+                for bid_attr, ask_attr in [("delayedBid", "delayedAsk"), ("bid", "ask")]:
+                    try:
+                        bid = getattr(t, bid_attr, None)
+                        ask = getattr(t, ask_attr, None)
+                        if bid and ask and float(bid) > 0 and float(ask) > 0:
+                            prices[s] = (float(bid) + float(ask)) / 2.0
+                            break
+                    except Exception:
+                        continue
+        missing = [s for s in symbols if prices[s] is None]
+        if missing:
+            yf_prices = self._prices_from_yfinance(missing)
+            for s in missing:
+                prices[s] = yf_prices.get(s)
+        still_missing = [s for s in symbols if prices[s] is None]
+        if still_missing:
+            log.warning(f"[Prices] No price available for: {still_missing}")
+        return prices
+
+    def _prices_from_yfinance(self, symbols: list) -> dict:
+        prices = {}
+        for s in symbols:
+            try:
+                df = yf.download(s, period="5d", interval="1d", progress=False, auto_adjust=True)
+                if not df.empty and "Close" in df.columns:
+                    prices[s] = float(df["Close"].dropna().iloc[-1])
+                else:
+                    prices[s] = None
+            except Exception:
+                prices[s] = None
+        return prices
+
+    def get_intraday_bars(self, symbol: str, duration: str = "1 D", bar_size: str = "5 mins") -> pd.DataFrame:
+        if not self.ensure_connected():
+            return self._intraday_from_yfinance(symbol)
+        try:
+            contract = Stock(symbol, "SMART", "USD")
+            bars = self.ib.reqHistoricalData(
+                contract,
+                endDateTime="",
+                durationStr=duration,
+                barSizeSetting=bar_size,
+                whatToShow="TRADES",
+                useRTH=True,
+                formatDate=1,
+                keepUpToDate=False,
+            )
+            if bars:
+                df = util.df(bars)
+                df.columns = [c.lower() for c in df.columns]
+                df.index = pd.to_datetime(df["date"])
+                return df[["open", "high", "low", "close", "volume"]]
+        except Exception as e:
+            log.debug(f"[IB] get_intraday_bars({symbol}): {e}")
+        return self._intraday_from_yfinance(symbol)
+
+    def _intraday_from_yfinance(self, symbol: str) -> pd.DataFrame:
+        try:
+            df = yf.download(symbol, period="2d", interval="5m", progress=False, auto_adjust=True)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.droplevel(1)
+            df.columns = [c.lower() for c in df.columns]
+            return df[["open", "high", "low", "close", "volume"]].dropna()
+        except Exception:
+            return pd.DataFrame()
+
+    def place_limit_order(self, symbol: str, qty: int, price: float) -> bool:
+        if not self.ensure_connected():
+            return False
+        if qty == 0:
+            return True
+        side = "BUY" if qty > 0 else "SELL"
+        limit_px = round(price * (1 + LIMIT_ORDER_OFFSET_PCT), 2) if qty > 0 else round(price * (1 - LIMIT_ORDER_OFFSET_PCT), 2)
+        try:
+            contract = Stock(symbol, "SMART", "USD")
+            order = LimitOrder(side, abs(qty), limit_px)
+            trade = self.ib.placeOrder(contract, order)
+            log.info(f"[Order] LIMIT {side} {abs(qty)} {symbol} @ ${limit_px:.2f} (orderId={getattr(trade, 'orderId', 'n/a')})")
+            return True
+        except Exception as e:
+            log.error(f"[Order] Limit order failed {symbol}: {e}")
+            return False
+
+    def place_market_order(self, symbol: str, qty: int) -> bool:
+        if not self.ensure_connected():
+            return False
+        if qty == 0:
+            return True
+        side = "BUY" if qty > 0 else "SELL"
+        try:
+            contract = Stock(symbol, "SMART", "USD")
+            order = MarketOrder(side, abs(qty))
+            trade = self.ib.placeOrder(contract, order)
+            log.info(f"[Order] MARKET {side} {abs(qty)} {symbol} (orderId={getattr(trade, 'orderId', 'n/a')})")
+            return True
+        except Exception as e:
+            log.error(f"[Order] Market order failed {symbol}: {e}")
+            return False
+
+
+def compute_rsi(prices: pd.Series, period: int = 14) -> float:
+    if len(prices) < period + 1:
+        return 50.0
+    delta = prices.diff().dropna()
+    gains = delta.clip(lower=0)
+    losses = (-delta).clip(lower=0)
+    avg_g = gains.ewm(com=period - 1, min_periods=period).mean().iloc[-1]
+    avg_l = losses.ewm(com=period - 1, min_periods=period).mean().iloc[-1]
+    rs = avg_g / (avg_l + 1e-10)
+    return float(100 - 100 / (1 + rs))
+
+
+def build_market_snapshot(symbol: str, ibm: IBManager) -> Optional[MarketSnapshot]:
+    bars = ibm.get_intraday_bars(symbol, duration="1 D", bar_size="5 mins")
+    if bars.empty or len(bars) < 5:
+        return None
+    close = bars["close"]
+    vol = bars["volume"]
+    typical_px = (bars["high"] + bars["low"] + bars["close"]) / 3
+    vwap = float((typical_px * vol).sum() / (vol.sum() + 1e-10))
+    last_price = float(close.iloc[-1])
+    open_price = float(bars["open"].iloc[0])
+    roll_mean = close.rolling(6).mean()
+    roll_std = close.rolling(6).std()
+    last_z = float((close.iloc[-1] - roll_mean.iloc[-1]) / (roll_std.iloc[-1] + 1e-10))
+    if len(close) >= 13:
+        ret_1h = float(close.iloc[-1] / close.iloc[-13] - 1)
+    else:
+        ret_1h = 0.0
+    try:
+        prev_df = ibm.get_intraday_bars(symbol, duration="2 D", bar_size="1 day")
+        if len(prev_df) >= 2:
+            prev_close = float(prev_df["close"].iloc[-2])
+            ret_today = (last_price - prev_close) / (prev_close + 1e-10)
+        else:
+            ret_today = (last_price - open_price) / (open_price + 1e-10)
+    except Exception:
+        ret_today = (last_price - open_price) / (open_price + 1e-10)
+    try:
+        daily_df = yf.download(symbol, period="25d", interval="1d", progress=False, auto_adjust=True)
+        avg_vol_20d = float(daily_df["Volume"].dropna().tail(20).mean())
+        cum_vol_today = float(vol.sum())
+        vol_ratio = cum_vol_today / (avg_vol_20d + 1e-10)
+    except Exception:
+        vol_ratio = 1.0
+    return MarketSnapshot(
+        symbol=symbol,
+        last_price=last_price,
+        vwap=vwap,
+        open_price=open_price,
+        high_price=float(bars["high"].max()),
+        low_price=float(bars["low"].min()),
+        return_today=ret_today,
+        return_1h=ret_1h,
+        rsi_14=compute_rsi(close, period=14),
+        zscore_30m=last_z,
+        volume_ratio=vol_ratio,
+    )
+
+
+def momentum_signal(snap: MarketSnapshot) -> StrategySignal:
+    if snap.vwap <= 0:
+        return StrategySignal(snap.symbol, 0, 0.0, "momentum", 0.0, "No VWAP data")
+    vwap_dev = (snap.last_price - snap.vwap) / (snap.vwap + 1e-10)
+    if vwap_dev > VWAP_MOMENTUM_THRESHOLD_STRONG:
+        direction = +1
+        confidence = min(0.95, 0.55 + abs(vwap_dev) * 20)
+        reason = f"Strong upside momentum: price {vwap_dev:+.2%} vs VWAP"
+    elif vwap_dev > VWAP_MOMENTUM_THRESHOLD:
+        direction = +1
+        confidence = min(0.70, 0.50 + abs(vwap_dev) * 15)
+        reason = f"Mild upside momentum: price {vwap_dev:+.2%} vs VWAP"
+    elif vwap_dev < -VWAP_MOMENTUM_THRESHOLD_STRONG:
+        direction = -1
+        confidence = min(0.95, 0.55 + abs(vwap_dev) * 20)
+        reason = f"Strong downside momentum: price {vwap_dev:+.2%} vs VWAP"
+    elif vwap_dev < -VWAP_MOMENTUM_THRESHOLD:
+        direction = -1
+        confidence = min(0.70, 0.50 + abs(vwap_dev) * 15)
+        reason = f"Mild downside momentum: price {vwap_dev:+.2%} vs VWAP"
+    else:
+        return StrategySignal(snap.symbol, 0, 0.0, "momentum", 0.0, f"Price within VWAP band: {vwap_dev:+.3%}")
+    if snap.volume_ratio > 1.5:
+        confidence = min(0.95, confidence * 1.15)
+    elif snap.volume_ratio < 0.5:
+        confidence *= 0.80
+    if direction == +1 and snap.rsi_14 > 70:
+        confidence *= 0.80
+        reason += " (RSI overbought)"
+    elif direction == -1 and snap.rsi_14 < 30:
+        confidence *= 0.80
+        reason += " (RSI oversold)"
+    size_pct = min(SIGNAL_MAX_TRADE_PCT, SIGNAL_MAX_TRADE_PCT * confidence)
+    return StrategySignal(snap.symbol, direction, confidence, "momentum", size_pct, reason)
+
+
+def mean_reversion_signal(snap: MarketSnapshot) -> StrategySignal:
+    z = snap.zscore_30m
+    if z > MEAN_REVERSION_ZSCORE:
+        direction = -1
+        confidence = min(0.90, 0.50 + (z - MEAN_REVERSION_ZSCORE) * 0.15)
+        reason = f"Mean reversion: z={z:.2f} (overbought)"
+        if snap.rsi_14 > 75:
+            confidence = min(0.95, confidence * 1.10)
+            reason += " + RSI overbought"
+    elif z < -MEAN_REVERSION_ZSCORE:
+        direction = +1
+        confidence = min(0.90, 0.50 + (abs(z) - MEAN_REVERSION_ZSCORE) * 0.15)
+        reason = f"Mean reversion: z={z:.2f} (oversold)"
+        if snap.rsi_14 < 25:
+            confidence = min(0.95, confidence * 1.10)
+            reason += " + RSI oversold"
+    else:
+        return StrategySignal(snap.symbol, 0, 0.0, "mean_reversion", 0.0, f"z={z:.2f} within normal range")
+    size_pct = min(SIGNAL_MAX_TRADE_PCT * 0.75, SIGNAL_MAX_TRADE_PCT * 0.75 * confidence)
+    return StrategySignal(snap.symbol, direction, confidence, "mean_reversion", size_pct, reason)
+
+
+def regime_change_signal(state: FundState, target_blend: dict) -> list:
+    if not state.regime_changed:
+        return []
+    log.info(f"[Signal] REGIME CHANGE detected → Phase {state.current_phase}")
+    signals = []
+    for sym, alloc in target_blend.items():
+        tradable = TRADABLE_UNIVERSE.get(sym)
+        if tradable is None:
+            continue
+        direction = +1 if alloc > 0 else 0
+        signals.append(StrategySignal(
+            symbol=tradable,
+            direction=direction,
+            confidence=0.95,
+            source="regime",
+            size_pct=float(alloc),
+            reasoning=f"Regime changed to Phase {state.current_phase}",
+        ))
+    return signals
+
+
+class AIAgent:
+    def __init__(self, state: FundState):
+        self.state = state
+        self.client = anthropic.Anthropic() if ANTHROPIC_AVAILABLE else None
+        self._last_call = datetime.datetime.min
+
+    def _build_prompt(self, snapshots: dict, signals: list, news_summary: str) -> str:
+        snapshot_data = {}
+        for sym, snap in snapshots.items():
+            if snap:
+                snapshot_data[sym] = {
+                    "last_price": round(snap.last_price, 2),
+                    "vwap_dev_pct": round((snap.last_price / snap.vwap - 1) * 100, 2),
+                    "rsi_14": round(snap.rsi_14, 1),
+                    "return_today": f"{snap.return_today*100:+.2f}%",
+                    "return_1h": f"{snap.return_1h*100:+.2f}%",
+                    "zscore": round(snap.zscore_30m, 2),
+                }
+        signal_data = [{"symbol": s.symbol, "direction": s.direction, "confidence": round(s.confidence, 2), "source": s.source, "reasoning": s.reasoning} for s in signals]
+        context = {
+            "current_phase": self.state.current_phase,
+            "current_blend": self.state.current_blend,
+            "net_liq_usd": round(self.state.net_liq, 2),
+            "daily_pnl_pct": f"{self.state.daily_pnl_pct*100:+.2f}%",
+            "market_snapshots": snapshot_data,
+            "active_signals": signal_data,
+            "news_summary": news_summary or "No news signal available.",
+            "trades_today": self.state.trades_today,
+        }
+        return (
+            "You are a quantitative portfolio manager running a systematic ETF fund.\n\n"
+            "Current portfolio context:\n"
+            f"{json.dumps(context, indent=2)}\n\n"
+            "Your task is to analyze this context and return a JSON decision object.\n\n"
+            "Consider:\n"
+            "- Are the signals consistent or conflicting?\n"
+            "- Does the news/macro backdrop support or contradict the technical signals?\n"
+            "- What is the risk/reward given current regime and daily P&L?\n"
+            "- Are we overtrading (trades_today is already high)?\n"
+            "- Should position sizing be adjusted from default?\n\n"
+            "Return ONLY a JSON object with exactly these fields (no markdown, no explanation):\n"
+            "{\n"
+            "  \"conviction\": <float -1.0 to 1.0, where -1=very bearish, 0=neutral, 1=very bullish>,\n"
+            "  \"phase_override\": <null or \"1\" or \"1b\" or \"2\" or \"3\" or \"4\">,\n"
+            "  \"sizing_multiplier\": <float 0.5 to 1.5>,\n"
+            "  \"priority_action\": <\"rebalance\", \"trim_risk\", \"add_exposure\", \"hold\", \"halt\">,\n"
+            "  \"symbols_to_increase\": [<list of symbols to increase allocation>],\n"
+            "  \"symbols_to_decrease\": [<list of symbols to decrease allocation>],\n"
+            "  \"reasoning\": <one sentence max 25 words explaining the key decision driver>\n"
+            "}\n"
+        )
+
+    def run(self, snapshots: dict, signals: list, news_summary: str = "") -> dict:
+        neutral = {
+            "conviction": 0.0,
+            "phase_override": None,
+            "sizing_multiplier": 1.0,
+            "priority_action": "hold",
+            "symbols_to_increase": [],
+            "symbols_to_decrease": [],
+            "reasoning": "AI agent fallback — holding.",
+        }
+        if not ANTHROPIC_AVAILABLE or self.client is None:
+            return neutral
+        try:
+            prompt = self._build_prompt(snapshots, signals, news_summary)
+            response = self.client.messages.create(
+                model=AI_MODEL,
+                max_tokens=AI_MAX_TOKENS,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw_text = response.content[0].text.strip()
+            raw_text = raw_text.replace("```json", "").replace("```", "").strip()
+            decision = json.loads(raw_text)
+            decision["conviction"] = float(np.clip(decision.get("conviction", 0.0), -1.0, 1.0))
+            decision["sizing_multiplier"] = float(np.clip(decision.get("sizing_multiplier", 1.0), 0.5, 1.5))
+            with self.state.lock:
+                self.state.ai_conviction = decision["conviction"]
+                self.state.ai_reasoning = decision.get("reasoning", "")
+            log.info(f"[AI Agent] conviction={decision['conviction']:+.2f}  action={decision['priority_action']}  reason: {decision.get('reasoning','')}")
+            return decision
+        except Exception as e:
+            log.warning(f"[AI Agent] Call failed: {e} — using neutral hold.")
+            return neutral
+
+
+class RiskManager:
+    def __init__(self, state: FundState, ibm: IBManager):
+        self.state = state
+        self.ibm = ibm
+        self._open_nlv = None
+
+    def record_open_nlv(self, nlv: float):
+        self._open_nlv = nlv
+        log.info(f"[Risk] Open NAV recorded: ${nlv:,.2f}")
+
+    def check_daily_pnl(self, current_nlv: float) -> bool:
+        if self._open_nlv is None or self._open_nlv <= 0:
+            return True
+        daily_pnl = (current_nlv - self._open_nlv) / self._open_nlv
+        with self.state.lock:
+            self.state.daily_pnl_pct = daily_pnl
+        if daily_pnl < -MAX_DAILY_LOSS_PCT:
+            log.warning(f"[Risk] CIRCUIT BREAKER: daily P&L {daily_pnl:+.2%} < -{MAX_DAILY_LOSS_PCT:.1%} — trading halted.")
+            with self.state.lock:
+                self.state.circuit_breaker = True
+                self.state.trading_halted = True
+            return False
+        return True
+
+    def is_order_allowed(self, symbol: str, qty: int, price: float, nlv: float) -> tuple:
+        if self.state.circuit_breaker:
+            return False, "Circuit breaker active — trading halted."
+        value = abs(qty) * price
+        if value < MIN_ORDER_VALUE:
+            return False, f"Order value ${value:.2f} < minimum ${MIN_ORDER_VALUE}"
+        positions = self.state.positions.copy()
+        new_val = (positions.get(symbol, 0) + qty) * price
+        if new_val / (nlv + 1e-10) > MAX_SINGLE_POSITION_PCT:
+            return False, f"{symbol} would reach {new_val/nlv:.1%} of NAV > {MAX_SINGLE_POSITION_PCT:.0%} limit"
+        return True, "OK"
+
+    def new_trading_day(self, nlv: float):
+        with self.state.lock:
+            self.state.circuit_breaker = False
+            self.state.trading_halted = False
+            self.state.trades_today = 0
+            self.state.rebalances_today = 0
+            self.state.session_date = datetime.date.today()
+        self.record_open_nlv(nlv)
+        log.info("[Risk] New trading day — circuit breakers reset.")
+
+
+class PortfolioRebalancer:
+    def __init__(self, state: FundState, ibm: IBManager, risk: RiskManager):
+        self.state = state
+        self.ibm = ibm
+        self.risk = risk
+
+    def rebalance(self, blend: dict, nlv: float, urgent: bool = False, ai_sizing: float = 1.0, source: str = "scheduled") -> int:
+        if self.state.trading_halted:
+            log.warning("[Rebalancer] Trading halted — skipping rebalance.")
+            return 0
+        target_alloc = {}
+        for key, alloc in blend.items():
+            sym = TRADABLE_UNIVERSE.get(key)
+            if sym is None:
+                continue
+            target_alloc[sym] = target_alloc.get(sym, 0.0) + float(alloc) * ai_sizing
+        total = sum(target_alloc.values())
+        if total > 1.0:
+            target_alloc = {k: v / total for k, v in target_alloc.items()}
+        symbols = list(target_alloc.keys())
+        prices = self.ibm.get_prices(symbols)
+        positions = self.ibm.get_positions()
+        orders_placed = 0
+        for sym in symbols:
+            price = prices.get(sym)
+            if price is None or price <= 0:
+                log.warning(f"[Rebalancer] No price for {sym} — skipping.")
+                continue
+            target_value = nlv * target_alloc[sym]
+            target_shares = int(round(target_value / price))
+            current_shares = int(round(float(positions.get(sym, 0))))
+            delta = target_shares - current_shares
+            if abs(delta) * price / (nlv + 1e-10) < ORDER_TOLERANCE_PCT:
+                log.debug(f"[Rebalancer] {sym}: delta {delta} below tolerance — skip")
+                continue
+            if abs(delta) * price < MIN_ORDER_VALUE:
+                log.debug(f"[Rebalancer] {sym}: order value too small — skip")
+                continue
+            allowed, reason = self.risk.is_order_allowed(sym, delta, price, nlv)
+            if not allowed:
+                log.warning(f"[Rebalancer] {sym}: blocked — {reason}")
+                continue
+            success = self.ibm.place_market_order(sym, delta) if urgent else self.ibm.place_limit_order(sym, delta, price)
+            if success:
+                orders_placed += 1
+                record = TradeRecord(
+                    timestamp=datetime.datetime.now().isoformat(),
+                    symbol=sym,
+                    side="BUY" if delta > 0 else "SELL",
+                    qty=abs(delta),
+                    price=price,
+                    value=abs(delta) * price,
+                    source=source,
+                    reasoning=f"Blend={target_alloc[sym]:.2%} AI_mult={ai_sizing:.2f}",
+                )
+                with self.state.lock:
+                    self.state.trade_log.append(record)
+                    self.state.trades_today += 1
+        if orders_placed > 0:
+            with self.state.lock:
+                self.state.rebalances_today += 1
+            log.info(f"[Rebalancer] {source}: placed {orders_placed} orders (rebalance #{self.state.rebalances_today} today)")
+        return orders_placed
+
+
+def load_model_state(pkl_path: str = "model_results.pkl") -> dict:
+    defaults = {
+        "current_regime": 1,
+        "current_phase_eff": "1",
+        "phase_blend": {
+            1: {"FACTOR": 0.70, "SPY": 0.20, "QQQ": 0.00, "GLD": 0.05, "TLT": 0.05},
+            "1b": {"FACTOR": 0.60, "SPY": 0.15, "QQQ": 0.20, "GLD": 0.05, "TLT": 0.00},
+            2: {"FACTOR": 0.50, "SPY": 0.10, "QQQ": 0.35, "GLD": 0.05, "TLT": 0.00},
+            3: {"FACTOR": 0.30, "SPY": 0.00, "QQQ": 0.00, "GLD": 0.15, "TLT": 0.15},
+            4: {"FACTOR": 0.55, "SPY": 0.15, "QQQ": 0.00, "GLD": 0.15, "TLT": 0.15},
+        },
+        "news_signal": None,
+        "regime": None,
+    }
+    try:
+        with open(pkl_path, "rb") as f:
+            data = pickle.load(f)
+        log.info(f"[State] Loaded model_results.pkl (generated {data.get('generated_at','?')})")
+        return {
+            "current_regime": int(data.get("current_regime", 1)),
+            "current_phase_eff": str(data.get("current_phase_eff", "1")),
+            "phase_blend": data.get("phase_blend", defaults["phase_blend"]),
+            "news_signal": data.get("news_signal"),
+            "regime": data.get("regime"),
+        }
+    except FileNotFoundError:
+        log.warning(f"[State] {pkl_path} not found — using default Phase 1 state.")
+        log.warning("        Run FAMWithAIA.py first to generate model_results.pkl")
+        return defaults
+    except Exception as e:
+        log.error(f"[State] Failed to load pickle: {e} — using defaults.")
+        return defaults
+
+
+class FundManager:
+    def __init__(self, approval_required: bool = False):
+        self.state = FundState()
+        self.ibm = IBManager(self.state)
+        self.risk = RiskManager(self.state, self.ibm)
+        self.rebal = PortfolioRebalancer(self.state, self.ibm, self.risk)
+        self.ai_agent = AIAgent(self.state)
+        self._approval_required = approval_required
+        self._stop_event = threading.Event()
+        self._monitored_syms = ["SPY", "QQQ", "GLD", "TLT"]
+
+    def start(self):
+        log.info("═" * 60)
+        log.info("  FundManager starting...")
+        log.info("  Strategy desks: ETF Sleeve + Intraday Signals + AI Agent")
+        log.info(f"  Market data type: {IB_MARKET_DATA_TYPE} ({'live' if IB_MARKET_DATA_TYPE == 1 else '15-min delayed'})")
+        log.info("═" * 60)
+        if not self.ibm.connect():
+            log.error("Cannot start without IB connection.")
+            return
+        self._refresh_model_state()
+        nlv = self.ibm.get_account_nlv()
+        with self.state.lock:
+            self.state.net_liq = nlv
+        self.risk.record_open_nlv(nlv)
+        log.info(f"  Account NAV: ${nlv:,.2f}")
+        self._do_scheduled_rebalance("startup")
+        threads = [
+            threading.Thread(target=self._thread_scheduled_rebalancer, name="ScheduledRebalancer", daemon=True),
+            threading.Thread(target=self._thread_intraday_signals, name="IntradaySignals", daemon=True),
+            threading.Thread(target=self._thread_ai_agent, name="AIAgent", daemon=True),
+            threading.Thread(target=self._thread_risk_monitor, name="RiskMonitor", daemon=True),
+            threading.Thread(target=self._thread_state_refresher, name="StateRefresher", daemon=True),
+        ]
+        for t in threads:
+            t.start()
+            log.info(f"  Thread started: {t.name}")
+        log.info("\n[FundManager] All desks live.  STOP_LIVE file or Ctrl+C to exit.\n")
+        try:
+            while not self._stop_event.is_set():
+                if os.path.exists("STOP_LIVE"):
+                    log.info("[FundManager] STOP_LIVE sentinel detected — shutting down.")
+                    break
+                time.sleep(5)
+        except KeyboardInterrupt:
+            log.info("[FundManager] Keyboard interrupt — shutting down.")
+        finally:
+            self.stop()
+
+    def stop(self):
+        self._stop_event.set()
+        try:
+            self.ibm.ib.disconnect()
+        except Exception:
+            pass
+        log.info("[FundManager] Disconnected. Goodbye.")
+
+    def _thread_scheduled_rebalancer(self):
+        fired_today = set()
+        last_date = None
+        while not self._stop_event.is_set():
+            now_et = _eastern_now()
+            if last_date != now_et.date():
+                fired_today = set()
+                last_date = now_et.date()
+                nlv = self.ibm.get_account_nlv()
+                self.risk.new_trading_day(nlv)
+                with self.state.lock:
+                    self.state.net_liq = nlv
+            for hr, mn in DAILY_REBALANCE_TIMES:
+                slot_key = f"{now_et.date()}-{hr:02d}{mn:02d}"
+                if slot_key in fired_today:
+                    continue
+                slot_time = now_et.replace(hour=hr, minute=mn, second=0, microsecond=0)
+                diff_sec = (now_et - slot_time).total_seconds()
+                if 0 <= diff_sec <= 60:
+                    log.info(f"[Scheduler] Firing scheduled rebalance: {hr:02d}:{mn:02d} ET")
+                    self._do_scheduled_rebalance(f"sched_{hr:02d}{mn:02d}")
+                    fired_today.add(slot_key)
+            time.sleep(30)
+
+    def _do_scheduled_rebalance(self, source: str):
+        nlv = self.ibm.get_account_nlv()
+        if nlv <= 0:
+            log.warning("[Rebalancer] Cannot get valid NAV — skipping.")
+            return
+        with self.state.lock:
+            self.state.net_liq = nlv
+            blend = dict(self.state.current_blend)
+            ai_sizing = float(np.clip(1.0 + self.state.ai_conviction * 0.25, 0.75, 1.25))
+        self.rebal.rebalance(blend, nlv, urgent=False, ai_sizing=ai_sizing, source=source)
+
+    def _thread_intraday_signals(self):
+        while not self._stop_event.is_set():
+            try:
+                if self.state.trading_halted or not _is_market_hours():
+                    time.sleep(SIGNAL_CHECK_INTERVAL_SEC)
+                    continue
+                snapshots = {}
+                all_signals = []
+                for sym in self._monitored_syms:
+                    snap = build_market_snapshot(sym, self.ibm)
+                    snapshots[sym] = snap
+                    if snap is None:
+                        continue
+                    mom_sig = momentum_signal(snap)
+                    rev_sig = mean_reversion_signal(snap)
+                    for sig in (mom_sig, rev_sig):
+                        if sig.direction != 0 and sig.confidence > SIGNAL_CONFIDENCE_GATE:
+                            all_signals.append(sig)
+                            log.info(f"[Signal] {sig.source.upper()} {sym} dir={sig.direction:+d} conf={sig.confidence:.2f} — {sig.reasoning}")
+                regime_sigs = regime_change_signal(self.state, self.state.current_blend)
+                if regime_sigs:
+                    all_signals.extend(regime_sigs)
+                    log.info("[Signal] REGIME CHANGE — executing immediate rebalance")
+                    nlv = self.state.net_liq
+                    self.rebal.rebalance(self.state.current_blend, nlv, urgent=True, source="regime_change")
+                    with self.state.lock:
+                        self.state.regime_changed = False
+                with self.state.lock:
+                    self.state.latest_signals = all_signals
+                if all_signals and not regime_sigs:
+                    self._execute_signal_trades(all_signals, snapshots)
+            except Exception as e:
+                log.error(f"[IntradaySignals] Error: {e}", exc_info=True)
+            time.sleep(SIGNAL_CHECK_INTERVAL_SEC)
+
+    def _execute_signal_trades(self, signals: list, snapshots: dict):
+        nlv = self.state.net_liq
+        prices = self.ibm.get_prices(self._monitored_syms)
+        positions = self.ibm.get_positions()
+        for sig in signals:
+            if sig.confidence < SIGNAL_CONFIDENCE_GATE:
+                continue
+            if sig.symbol not in prices or prices[sig.symbol] is None:
+                continue
+            price = prices[sig.symbol]
+            trade_val = nlv * sig.size_pct * (1.0 + self.state.ai_conviction * 0.20)
+            trade_val = min(trade_val, nlv * SIGNAL_MAX_TRADE_PCT)
+            shares = int(round(trade_val / price)) * sig.direction
+            allowed, reason = self.risk.is_order_allowed(sig.symbol, shares, price, nlv)
+            if not allowed:
+                log.debug(f"[Intraday] {sig.symbol} blocked: {reason}")
+                continue
+            success = self.ibm.place_limit_order(sig.symbol, shares, price)
+            if success:
+                record = TradeRecord(
+                    timestamp=datetime.datetime.now().isoformat(),
+                    symbol=sig.symbol,
+                    side="BUY" if shares > 0 else "SELL",
+                    qty=abs(shares),
+                    price=price,
+                    value=abs(shares) * price,
+                    source=f"intraday_{sig.source}",
+                    reasoning=sig.reasoning,
+                )
+                with self.state.lock:
+                    self.state.trade_log.append(record)
+                    self.state.trades_today += 1
+
+    def _thread_ai_agent(self):
+        while not self._stop_event.is_set():
+            try:
+                if not _is_market_hours():
+                    time.sleep(AI_AGENT_INTERVAL_SEC)
+                    continue
+                snapshots = {s: build_market_snapshot(s, self.ibm) for s in self._monitored_syms}
+                news_summary = ""
+                try:
+                    from NewsAgent import NewsAgent
+                    na = NewsAgent()
+                    sig = na.get_signal()
+                    news_summary = (
+                        f"Macro sentiment: {sig.macro_sentiment:+.2f}  "
+                        f"Risk-on: {sig.risk_on_score:.2f}  "
+                        f"Recession prob (Polymarket): {sig.recession_prob:.1%}  "
+                        f"Fed cut prob: {sig.fed_cut_prob:.1%}  "
+                        f"Top risks: {', '.join(sig.top_risks[:2])}"
+                    )
+                except Exception:
+                    pass
+                with self.state.lock:
+                    signals = list(self.state.latest_signals)
+                decision = self.ai_agent.run(snapshots, signals, news_summary)
+                if self._approval_required and decision["priority_action"] != "hold":
+                    approved = self._request_approval(decision)
+                    if not approved:
+                        log.info("[AI Agent] Trade not approved — skipping.")
+                        time.sleep(AI_AGENT_INTERVAL_SEC)
+                        continue
+                if decision["priority_action"] == "halt":
+                    log.warning("[AI Agent] HALT signal — pausing all trading.")
+                    with self.state.lock:
+                        self.state.trading_halted = True
+                elif decision["priority_action"] in ("rebalance", "trim_risk", "add_exposure"):
+                    ai_sizing = decision["sizing_multiplier"]
+                    nlv = self.state.net_liq
+                    self.rebal.rebalance(self.state.current_blend, nlv, urgent=False, ai_sizing=ai_sizing, source=f"ai_{decision['priority_action']}")
+            except Exception as e:
+                log.error(f"[AIAgent] Error: {e}", exc_info=True)
+            time.sleep(AI_AGENT_INTERVAL_SEC)
+
+    def _thread_risk_monitor(self):
+        while not self._stop_event.is_set():
+            try:
+                nlv = self.ibm.get_account_nlv()
+                if nlv > 0:
+                    with self.state.lock:
+                        self.state.net_liq = nlv
+                        self.state.positions = self.ibm.get_positions()
+                    self.risk.check_daily_pnl(nlv)
+            except Exception as e:
+                log.error(f"[RiskMonitor] Error: {e}")
+            time.sleep(RISK_CHECK_INTERVAL_SEC)
+
+    def _thread_state_refresher(self):
+        prev_regime = self.state.current_regime
+        while not self._stop_event.is_set():
+            time.sleep(300)
+            try:
+                model = load_model_state()
+                new_regime = model["current_regime"]
+                new_phase = str(model["current_phase_eff"])
+                ph_key = new_phase if new_phase == "1b" else int(new_phase)
+                new_blend = model["phase_blend"].get(ph_key, self.state.current_blend)
+                with self.state.lock:
+                    if new_regime != prev_regime:
+                        log.info(f"[State] REGIME CHANGE: {prev_regime} → {new_regime}")
+                        self.state.regime_changed = True
+                    self.state.current_regime = new_regime
+                    self.state.current_phase = new_phase
+                    self.state.current_blend = new_blend
+                    prev_regime = new_regime
+                log.debug(f"[State] Refreshed: phase={new_phase} regime={new_regime}")
+            except Exception as e:
+                log.error(f"[StateRefresher] Error: {e}")
+
+    def _refresh_model_state(self):
+        model = load_model_state()
+        ph = str(model["current_phase_eff"])
+        ph_key = ph if ph == "1b" else int(ph)
+        blend = model["phase_blend"].get(ph_key, {})
+        with self.state.lock:
+            self.state.current_regime = model["current_regime"]
+            self.state.current_phase = ph
+            self.state.current_blend = blend
+        log.info(f"[State] Initial phase: {ph}  blend instruments: {[k for k,v in blend.items() if v>0]}")
+
+    def _request_approval(self, decision: dict) -> bool:
+        print(f"\n[AI AGENT APPROVAL REQUIRED]")
+        print(f"  Action   : {decision['priority_action']}")
+        print(f"  Sizing   : {decision['sizing_multiplier']:.2f}×")
+        print(f"  Reasoning: {decision.get('reasoning','')}")
+        try:
+            ans = input("  Approve? (y/n): ").strip().lower()
+            return ans == "y"
+        except Exception:
+            return False
+
+
+def _eastern_now() -> datetime.datetime:
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        utc_now = datetime.datetime.utcnow()
+        month = utc_now.month
+        offset = -4 if 3 <= month <= 11 else -5
+        return utc_now + datetime.timedelta(hours=offset)
+
+
+def _is_market_hours() -> bool:
+    now = _eastern_now()
+    if now.weekday() >= 5:
+        return False
+    market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    return market_open <= now <= market_close
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="FAMWithAIA live FundManager mode",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--live", action="store_true", help="Start the FundManager live trading loop")
+    parser.add_argument("--approval", action="store_true", help="Require console approval for AI-driven trades")
+    parser.add_argument("--live-data", action="store_true", help="Request live IB market data instead of delayed pricing")
+    parser.add_argument("--no-ai", action="store_true", help="Disable the AI agent")
+    parser.add_argument("--print-state", action="store_true", help="Print loaded model state and exit")
+    raw_args = [a for a in sys.argv[1:] if a.lower() != "live"]
+    if any(a.lower() == "live" for a in sys.argv[1:]):
+        raw_args.append("--live")
+    args, unknown = parser.parse_known_args(raw_args)
+
+    if args.print_state:
+        state = load_model_state()
+        print(f"Loaded model state: {state}")
+        return
+
+    if args.live:
+        if args.live_data:
+            global IB_MARKET_DATA_TYPE
+            IB_MARKET_DATA_TYPE = 1
+            log.info("[Config] Live market data requested.")
+        if args.no_ai:
+            global ANTHROPIC_AVAILABLE
+            ANTHROPIC_AVAILABLE = False
+            log.info("[Config] AI agent disabled.")
+        log.info(f"[Config] IB: {IB_HOST}:{IB_PORT} clientId={IB_CLIENT_ID}")
+        log.info(f"[Config] Market data type: {IB_MARKET_DATA_TYPE}")
+        log.info(f"[Config] Approval required: {args.approval}")
+        log.info(f"[Config] Rebalance schedule: {DAILY_REBALANCE_TIMES} ET")
+        manager = FundManager(approval_required=args.approval)
+        manager.start()
+
+
 # Simple CLI support: run headless live mode if `--live` or bare `live` present.
-cli_args = [a.lower() for a in sys.argv[1:]]
-if ("--live" in cli_args) or ("live" in cli_args):
-    print("\n[Main] Starting headless LIVE paper trading (paper) — see logs above.\n")
-    parser = _argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--interval", type=int, default=3600,
-                        help="Rebalance interval seconds for live mode (default: 3600)")
-    known, _ = parser.parse_known_args()
-    run_live_paper_trading(rebalance_interval=known.interval)
+if __name__ == "__main__":
+    main()
