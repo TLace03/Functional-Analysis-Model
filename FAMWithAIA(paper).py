@@ -2100,25 +2100,38 @@ def _build_tradable_blend(blend: dict) -> dict:
     return {k: float(v) / total for k, v in weights.items()}
 
 
-def _rebalance_portfolio(ib: IB, blend: dict, total_value: float,
-                         tolerance: float = 0.001) -> None:
-    target = _build_tradable_blend(blend)
-    if not target:
-        print("[Live] No tradable allocation after blend normalization.")
+def _rebalance_target_weights(ib: IB, target_weights: dict, total_value: float,
+                              tolerance: float = 0.001) -> None:
+    if not target_weights:
+        print("[Live] No tradable target weights provided for rebalance.")
         return
 
-    prices = _get_market_prices(ib, list(target.keys()))
+    try:
+        max_orders = int(os.environ.get("LIVE_MAX_ORDERS", "40"))
+    except Exception:
+        max_orders = 10
+    try:
+        batch_delay = float(os.environ.get("LIVE_ORDER_DELAY", "0.5"))
+    except Exception:
+        batch_delay = 1
+
+    prices = _get_market_prices(ib, list(target_weights.keys()))
     positions = _positions_dict(ib)
 
     orders = []
-    for symbol, weight in target.items():
+    for symbol, weight in target_weights.items():
         price = prices.get(symbol)
         if price is None:
             print(f"[Live] No valid price for {symbol}, skipping.")
             continue
 
-        target_value = float(total_value) * float(weight)
-        desired_qty = int(round(target_value / price))
+        desired_value = float(total_value) * float(weight)
+        try:
+            desired_qty = int(round(desired_value / price))
+        except Exception:
+            print(f"[Live] Failed to compute desired shares for {symbol}, skipping.")
+            continue
+
         current_qty = int(round(float(positions.get(symbol, 0))))
         delta = desired_qty - current_qty
         if abs(delta) * price < max(50.0, total_value * tolerance):
@@ -2130,8 +2143,77 @@ def _rebalance_portfolio(ib: IB, blend: dict, total_value: float,
         print("[Live] No orders to place after tolerance check.")
         return
 
+    orders.sort(key=lambda x: abs(x[1]), reverse=True)
+    if len(orders) > max_orders:
+        print(f"[Live] Limiting market order execution to top {max_orders} positions out of {len(orders)}.")
+        orders = orders[:max_orders]
+
+    print(f"[Live] Placing {len(orders)} market orders for drafted model positions.")
     for symbol, delta, price in orders:
-        _place_market_order(ib, symbol, delta)
+        print(f"[Live] ORDER: {symbol} delta={delta}, price={price:.2f}, target_value={(delta * price):,.2f}")
+        _place_market_order(ib, symbol, delta, delay=batch_delay)
+
+
+def _build_stock_target_weights(phase_key: str | int,
+                                min_weight_threshold: float = 0.0005) -> dict:
+    phase_weights = {
+        1: stock_w_growth,
+        "1b": stock_w_momentum,
+        2: stock_w_momentum,
+        3: stock_w_defensive,
+        4: stock_w_recovery,
+    }.get(phase_key)
+
+    if phase_weights is None:
+        print(f"[Live] No stock weight vector found for phase {phase_key}.")
+        return {}
+
+    symbols = [str(x) for x in returns.columns]
+    target = {}
+    for symbol, weight in zip(symbols, phase_weights):
+        try:
+            weight = float(weight)
+        except Exception:
+            continue
+        if weight <= min_weight_threshold or not np.isfinite(weight):
+            continue
+        tradable = TRADABLE_UNIVERSE.get(symbol, symbol)
+        if tradable is None:
+            print(f"[Live] Skipping non-tradable symbol: {symbol}")
+            continue
+        target[tradable] = target.get(tradable, 0.0) + weight
+
+    total = sum(target.values())
+    if total <= 0:
+        return {}
+    return {symbol: float(weight) / total for symbol, weight in target.items()}
+
+
+def _rebalance_model_portfolio(ib: IB, phase_key: str | int, total_value: float,
+                               tolerance: float = 0.001,
+                               min_weight_threshold: float = 0.0005) -> None:
+    target = _build_stock_target_weights(phase_key, min_weight_threshold=min_weight_threshold)
+    if target:
+        print(f"[Live] Rebalancing model portfolio for phase {phase_key} "
+              f"with {len(target)} positions and min weight {min_weight_threshold:.4%}.")
+        _rebalance_target_weights(ib, target, total_value, tolerance=tolerance)
+        return
+
+    blend = phase_blend.get(phase_key)
+    if blend:
+        print("[Live] Falling back to ETF sleeve blend for this phase.")
+        _rebalance_sleeves_to_blend(ib, blend, total_value, tolerance=tolerance)
+    else:
+        print(f"[Live] No tradable model portfolio or blend mapping available for phase {phase_key}.")
+
+
+def _rebalance_portfolio(ib: IB, blend: dict, total_value: float,
+                         tolerance: float = 0.001) -> None:
+    target = _build_tradable_blend(blend)
+    if not target:
+        print("[Live] No tradable allocation after blend normalization.")
+        return
+    _rebalance_target_weights(ib, target, total_value, tolerance=tolerance)
 
 
 def _schedule_next_rebalances(today: datetime.date) -> set:
@@ -2139,6 +2221,7 @@ def _schedule_next_rebalances(today: datetime.date) -> set:
 
 
 def _get_market_prices(ib: IB, symbols: list[str]) -> dict:
+    symbols = [str(s) for s in symbols]
     prices = {s: None for s in symbols}
     contracts = [Stock(s, "SMART", "USD") for s in symbols]
 
@@ -2241,15 +2324,26 @@ def _get_market_prices(ib: IB, symbols: list[str]) -> dict:
     return prices
 
 
-def _place_market_order(ib: IB, symbol: str, qty: int) -> None:
+def _place_market_order(ib: IB, symbol: str, qty: int, delay: float = 0.5) -> None:
     if qty == 0:
         return
-    contract = Stock(symbol, "SMART", "USD")
+    contract = Stock(str(symbol), "SMART", "USD")
     side = "BUY" if qty > 0 else "SELL"
     order = MarketOrder(side, abs(int(qty)))
     try:
         trade = ib.placeOrder(contract, order)
-        print(f"[IB] Placed {side} {abs(int(qty))} {symbol} (tradeId={getattr(trade, 'orderId', 'n/a')})")
+        order_id = getattr(trade.order, "orderId", None) or getattr(trade, "orderId", "n/a")
+        print(f"[IB] Placed {side} {abs(int(qty))} {symbol} (orderId={order_id})")
+        if hasattr(ib, "sleep"):
+            ib.sleep(delay)
+        if hasattr(trade, "waitUntilDone"):
+            try:
+                trade.waitUntilDone(timeout=10)
+            except Exception as e:
+                print(f"[IB] Waited for {symbol} but order did not complete immediately: {e}")
+        status = getattr(trade.orderStatus, "status", None)
+        if status:
+            print(f"[IB] {symbol} order status: {status}")
     except Exception as e:
         print(f"[IB] Failed to place order for {symbol}: {e}")
 
@@ -2357,13 +2451,27 @@ def run_live_paper_trading(rebalance_interval: int = 60, live_data: bool = False
         eff_now_live = resolve_phase(returns.index[-1], current_phase_live)
         ph_key_live = eff_now_live if eff_now_live == "1b" else int(eff_now_live)
         current_blend = phase_blend[ph_key_live]
-        print(f"[Live] Current phase: {eff_now_live} — applying blend: {current_blend}")
+        print(f"[Live] Current phase: {eff_now_live} — applying model portfolio for phase {eff_now_live}")
 
-        _rebalance_portfolio(ib, current_blend, float(net_liq), tolerance=tolerance)
+        try:
+            min_weight_threshold = float(os.environ.get("LIVE_MIN_POSITION_WEIGHT", "0.0005"))
+        except Exception:
+            min_weight_threshold = 0.0005
+            print("[Live] LIVE_MIN_POSITION_WEIGHT invalid, using 0.0005")
 
-        last_rebalance_date = pd.Timestamp.now().normalize()
+        _rebalance_model_portfolio(
+            ib,
+            ph_key_live,
+            float(net_liq),
+            tolerance=tolerance,
+            min_weight_threshold=min_weight_threshold,
+        )
+
+        last_rebalance_date = _eastern_now().date()
+        fired_today = set()
 
         print("[Live] Entering headless loop — press 'q' to exit (Ctrl+C will be ignored).")
+        print(f"[Live] Scheduled rebalance times (ET): {DAILY_REBALANCE_TIMES}")
         exit_pressed = _build_exit_checker()
 
         try:
@@ -2375,22 +2483,43 @@ def run_live_paper_trading(rebalance_interval: int = 60, live_data: bool = False
                         print("[Live] Exit key detected — shutting down live loop.")
                         raise SystemExit
 
-                now_date = pd.Timestamp.now().normalize()
-                if now_date > last_rebalance_date:
-                    try:
-                        net_liq = _get_account_net_liq_usd(ib) or net_liq
+                now_et = _eastern_now()
+                if now_et.date() != last_rebalance_date:
+                    fired_today.clear()
+                    last_rebalance_date = now_et.date()
+
+                for hr, mn in DAILY_REBALANCE_TIMES:
+                    slot_key = (hr, mn)
+                    if slot_key in fired_today:
+                        continue
+
+                    slot_time = now_et.replace(hour=hr, minute=mn, second=0, microsecond=0)
+                    diff = (now_et - slot_time).total_seconds()
+                    if 0 <= diff <= max(60, int(rebalance_interval)):
                         try:
-                            current_phase_live = int(regime.iloc[-1])
-                        except Exception:
-                            current_phase_live = int(current_regime)
-                        eff_now_live = resolve_phase(returns.index[-1], current_phase_live)
-                        ph_key_live = eff_now_live if eff_now_live == "1b" else int(eff_now_live)
-                        current_blend = phase_blend[ph_key_live]
-                        print(f"[Live] Daily rebalance — date {now_date.date()} phase {eff_now_live}")
-                        _rebalance_portfolio(ib, current_blend, float(net_liq), tolerance=tolerance)
-                        last_rebalance_date = now_date
-                    except Exception as e:
-                        print(f"[Live] Rebalance iteration failed: {e}")
+                            net_liq = _get_account_net_liq_usd(ib) or net_liq
+                            try:
+                                current_phase_live = int(regime.iloc[-1])
+                            except Exception:
+                                current_phase_live = int(current_regime)
+                            eff_now_live = resolve_phase(returns.index[-1], current_phase_live)
+                            ph_key_live = eff_now_live if eff_now_live == "1b" else int(eff_now_live)
+                            print(f"[Live] Scheduled rebalance at {hr:02d}:{mn:02d} ET — phase {eff_now_live}")
+                            try:
+                                min_weight_threshold = float(os.environ.get("LIVE_MIN_POSITION_WEIGHT", "0.0005"))
+                            except Exception:
+                                min_weight_threshold = 0.0005
+                                print("[Live] LIVE_MIN_POSITION_WEIGHT invalid, using 0.0005")
+                            _rebalance_model_portfolio(
+                                ib,
+                                ph_key_live,
+                                float(net_liq),
+                                tolerance=tolerance,
+                                min_weight_threshold=min_weight_threshold,
+                            )
+                            fired_today.add(slot_key)
+                        except Exception as e:
+                            print(f"[Live] Scheduled rebalance failed: {e}")
         except SystemExit:
             print("[Live] Live loop exited by user request.")
         except KeyboardInterrupt:
@@ -2441,10 +2570,12 @@ TRADABLE_UNIVERSE = {
 }
 
 DAILY_REBALANCE_TIMES = [
+    (7, 00),
     (9, 35),
     (11, 30),
     (13, 30),
     (15, 45),
+    ()
 ]
 
 SIGNAL_CHECK_INTERVAL_SEC = 300
@@ -3395,6 +3526,22 @@ def main():
         manager = FundManager(approval_required=args.approval)
         manager.start()
 
+import argparse as _argparse
+# Simple CLI support: run headless live mode if `--live` or bare `live` present.
+cli_args = [a.lower() for a in sys.argv[1:]]
+if ("--live" in cli_args) or ("live" in cli_args):
+    parser = _argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--interval", type=int, default=60,
+                        help="Polling interval seconds for live mode (default: 60)")
+    parser.add_argument("--tolerance", type=float, default=0.001,
+                        help="Order tolerance fraction of NAV before trades are placed")
+    parser.add_argument("--live-data", action="store_true",
+                        help="Request live IB market data instead of delayed pricing")
+    known, _ = parser.parse_known_args()
+    print("\n[Main] Starting headless LIVE paper trading master — see logs above.\n")
+    run_live_paper_trading(rebalance_interval=known.interval,
+                           live_data=known.live_data,
+                           tolerance=known.tolerance)
 
 # Simple CLI support: run headless live mode if `--live` or bare `live` present.
 if __name__ == "__main__":
